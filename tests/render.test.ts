@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { escapeTime } from '../src/render/cpu'
-import { fragmentShaderSource } from '../src/render/shaders'
+import { keyframeShaderSource, presentShaderSource } from '../src/render/shaders'
 import { MAX_ITERATIONS } from '../src/scene/quality'
 
 describe('escapeTime', () => {
@@ -36,19 +36,64 @@ describe('escapeTime', () => {
   })
 })
 
-describe('fragmentShaderSource', () => {
-  it('bakes the iteration cap in as a compile-time constant and honours the requested precision', () => {
-    const src = fragmentShaderSource('mediump')
-    expect(src).toContain(`const int MAX_ITER = ${MAX_ITERATIONS};`)
-    expect(src.trim().startsWith('precision mediump float;')).toBe(true)
-    expect(fragmentShaderSource('highp')).toContain('precision highp float;')
+/** Mirrors the shader's unrolled loop: two iterations per bailout test. */
+function pairwiseEscape(cx: number, cy: number, maxIter: number): number {
+  let zx = 0
+  let zy = 0
+  for (let i = 0; i < maxIter; i += 2) {
+    for (let k = 0; k < 2; k++) {
+      const nx = zx * zx - zy * zy + cx
+      zy = 2 * zx * zy + cy
+      zx = nx
+    }
+    const m = zx * zx + zy * zy
+    if (m > 256) return Math.max(0, i + 3 - Math.log2(Math.log2(m)))
+  }
+  return -1
+}
+
+describe('unrolled escape loop', () => {
+  it('matches the per-iteration smooth count closely wherever the point escapes', () => {
+    let worst = 0
+    for (let i = 0; i < 400; i++) {
+      const cx = -2 + (i % 20) * 0.13
+      const cy = -1.2 + Math.floor(i / 20) * 0.12
+      const exact = escapeTime(0, 0, cx, cy, 300).n
+      const paired = pairwiseEscape(cx, cy, 300)
+      if (exact < 0 || paired < 0) {
+        expect(exact < 0).toBe(paired < 0)
+        continue
+      }
+      worst = Math.max(worst, Math.abs(exact - paired))
+    }
+    expect(worst).toBeLessThan(0.05)
+  })
+})
+
+describe('shader sources', () => {
+  it('bakes an even iteration cap in as a compile-time constant for the two-step loop', () => {
+    expect(MAX_ITERATIONS % 2).toBe(0)
+    for (const julia of [false, true]) {
+      const src = keyframeShaderSource(julia)
+      expect(src).toContain(`const int MAX_ITER = ${MAX_ITERATIONS};`)
+      expect(src).toContain('i += 2')
+      expect(src.trim().startsWith('precision highp float;')).toBe(true)
+    }
+  })
+
+  it('only tracks the orbit trap and shades interiors in the Julia variant', () => {
+    expect(keyframeShaderSource(true)).toContain('trap = min(trap')
+    expect(keyframeShaderSource(false)).not.toContain('trap = min(trap')
+    expect(keyframeShaderSource(false)).toContain('insideMainBody')
+    expect(keyframeShaderSource(true)).not.toContain('insideMainBody')
   })
 
   it('does not use GLSL ES 3.00 syntax so it compiles on WebGL1', () => {
-    const src = fragmentShaderSource('highp')
-    expect(src).not.toMatch(/\bin\s+vec/)
-    expect(src).not.toMatch(/\bout\s+vec/)
-    expect(src).not.toContain('#version')
-    expect(src).not.toContain('texture(')
+    for (const src of [keyframeShaderSource(false), keyframeShaderSource(true), presentShaderSource()]) {
+      expect(src).not.toMatch(/\bin\s+vec/)
+      expect(src).not.toMatch(/\bout\s+vec/)
+      expect(src).not.toContain('#version')
+      expect(src).not.toContain('texture(')
+    }
   })
 })

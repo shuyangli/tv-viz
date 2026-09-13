@@ -28,6 +28,12 @@ export class CpuRenderer implements Renderer {
     this.setSize(canvas.width || CPU_WIDTH, canvas.height || CPU_WIDTH)
   }
 
+  readonly gpuMs = null
+
+  setQuality(): void {}
+
+  setBenchmark(): void {}
+
   setSize(width: number, height: number): void {
     this.canvas.width = width
     this.canvas.height = height

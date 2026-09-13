@@ -2,8 +2,9 @@ import { clamp } from './math'
 
 /**
  * Hard loop bound compiled into the shader. The CX's Mali-G51 manages roughly 2 billion
- * iterations per second, so this is the ceiling that keeps deep zooms near 30 fps at a
- * third of 1080p.
+ * iterations per second; at this ceiling a 1080p keyframe of a deep zoom takes about
+ * 100 ms, which spread over 6–8 frames leaves the display at 60 fps. Must be even: the
+ * shader loop is unrolled by two.
  */
 export const MAX_ITERATIONS = 300
 export const MIN_ITERATIONS = 80

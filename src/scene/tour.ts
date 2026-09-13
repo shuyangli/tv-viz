@@ -77,16 +77,23 @@ export class Tour {
   }
 
   frame(): SceneFrame {
+    return this.frameAt(0)
+  }
+
+  /**
+   * The frame `aheadSeconds` from now, without advancing. Clamped to the current scene:
+   * a keyframe predicted across a scene boundary would be reprojected through the wrong
+   * camera, and the fade to black at the boundary means a slightly stale one is invisible.
+   */
+  frameAt(aheadSeconds: number): SceneFrame {
     const scene = this.scene
     const duration = sceneDuration(scene)
-    const brightness = Math.max(
-      0,
-      Math.min(1, this.sceneTime / FADE_SECONDS, (duration - this.sceneTime) / FADE_SECONDS),
-    )
-    const base = scene.kind === 'dive' ? this.diveFrame(scene) : this.juliaFrame(scene)
+    const t = Math.max(0, Math.min(this.sceneTime + aheadSeconds, duration))
+    const brightness = Math.max(0, Math.min(1, t / FADE_SECONDS, (duration - t) / FADE_SECONDS))
+    const base = scene.kind === 'dive' ? this.diveFrame(scene, t) : this.juliaFrame(scene, t)
     return {
       ...base,
-      rotation: this.rotation,
+      rotation: (this.rotation + scene.spin * aheadSeconds) % TWO_PI,
       maxIter: scene.kind === 'julia' ? scene.iterations : iterationsForScale(base.scale),
       sceneName: scene.name,
       sceneIndex: this.index,
@@ -100,8 +107,7 @@ export class Tour {
     this.sceneTime = 0
   }
 
-  private diveFrame(scene: DiveScene): Pick<SceneFrame, 'center' | 'scale' | 'julia' | 'seed' | 'phase'> {
-    const t = this.sceneTime
+  private diveFrame(scene: DiveScene, t: number): Pick<SceneFrame, 'center' | 'scale' | 'julia' | 'seed' | 'phase'> {
     const targetScale = Math.max(scene.targetScale, MIN_SCALE)
     let scale: number
     let phase: Phase
@@ -116,7 +122,8 @@ export class Tour {
     } else {
       phase = 'out'
       const outTime = t - scene.zoomInSeconds - scene.holdSeconds
-      scale = logLerp(targetScale, OVERVIEW_SCALE, smoothstep(outTime / scene.zoomOutSeconds))
+      const progress = scene.zoomOutSeconds > 0 ? outTime / scene.zoomOutSeconds : 1
+      scale = logLerp(targetScale, OVERVIEW_SCALE, smoothstep(progress))
     }
     // Shrinking the overview offset in proportion to scale keeps the target pinned to the
     // same screen position for the whole zoom, so the eye never has to chase it.
@@ -128,9 +135,9 @@ export class Tour {
     return { center, scale, julia: false, seed: [0, 0], phase }
   }
 
-  private juliaFrame(scene: JuliaScene): Pick<SceneFrame, 'center' | 'scale' | 'julia' | 'seed' | 'phase'> {
-    const u = Math.min(1, this.sceneTime / scene.durationSeconds)
-    const wobble = TWO_PI * this.sceneTime
+  private juliaFrame(scene: JuliaScene, t: number): Pick<SceneFrame, 'center' | 'scale' | 'julia' | 'seed' | 'phase'> {
+    const u = Math.min(1, t / scene.durationSeconds)
+    const wobble = TWO_PI * t
     const scale = scene.scale * (1 + JULIA_BREATHE_AMOUNT * Math.sin(wobble / 31))
     const center: Vec2 = [
       JULIA_DRIFT_AMOUNT * Math.sin(wobble / 47),

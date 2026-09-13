@@ -1,8 +1,9 @@
 import { actionForKey, type RemoteAction } from './input/remote'
-import { AdaptiveResolution } from './perf/adaptive'
+import { AdaptiveBudget, TV_BUDGET_OPTIONS } from './perf/adaptive'
 import { CpuRenderer } from './render/cpu'
 import { GlRenderer } from './render/gl'
 import type { FrameParams, Renderer } from './render/types'
+import type { SceneFrame } from './scene/tour'
 import { PaletteMixer } from './scene/palette'
 import type { Scene } from './scene/scenes'
 import { Tour } from './scene/tour'
@@ -21,6 +22,8 @@ const JULIA_FAR_FIELD = 5
 /** rAF gaps longer than this are hitches (backgrounding, GC); the scene must not lurch to catch up. */
 const MAX_FRAME_SECONDS = 0.1
 const STARTUP_HUD_MS = 6000
+/** Smoothing for the frame interval fed to keyframe prediction; hitches must not throw the camera far ahead. */
+const FRAME_INTERVAL_SMOOTHING = 0.1
 const HELP_TEXT = '◀ ▶ scene   ▲ ▼ speed   ● ● ● ● palette   OK info   BACK exit'
 
 function createRenderer(canvas: HTMLCanvasElement): Renderer {
@@ -34,6 +37,11 @@ interface DebugParams {
   readonly seek: number | null
   /** `?cx=&cy=&s=` pins the camera on a custom Mandelbrot point, `?jx=&jy=` on a custom Julia seed, for scouting new scenes. */
   readonly custom: Scene | null
+  /** `?scale=` and `?tiles=` each pin one knob of the render budget while the other adapts, for measuring on the TV. */
+  readonly scale: number | null
+  readonly tiles: number | null
+  /** `?bench=1` waits for the GPU every frame and shows its time in the HUD. */
+  readonly bench: boolean
 }
 
 function numberParam(params: URLSearchParams, name: string): number | null {
@@ -43,8 +51,22 @@ function numberParam(params: URLSearchParams, name: string): number | null {
   return isNaN(value) ? null : value
 }
 
-function debugParams(): DebugParams {
+/** webOS launches from file:// with no query string; `ares-launch --params '{"tiles":6}'` arrives here instead. */
+function launchParams(): URLSearchParams {
   const params = new URLSearchParams(window.location.search)
+  const palm = (window as unknown as { PalmSystem?: { launchParams?: string } }).PalmSystem
+  if (!palm || !palm.launchParams) return params
+  try {
+    const launched = JSON.parse(palm.launchParams) as Record<string, unknown>
+    for (const key of Object.keys(launched)) params.set(key, String(launched[key]))
+  } catch {
+    // Not JSON: nothing to merge.
+  }
+  return params
+}
+
+function debugParams(): DebugParams {
+  const params = launchParams()
   const cx = numberParam(params, 'cx')
   const cy = numberParam(params, 'cy')
   const s = numberParam(params, 's')
@@ -73,7 +95,21 @@ function debugParams(): DebugParams {
       spin: 0,
     }
   }
-  return { scene: numberParam(params, 'scene'), seek: numberParam(params, 't'), custom }
+  return {
+    scene: numberParam(params, 'scene'),
+    seek: numberParam(params, 't'),
+    custom,
+    scale: numberParam(params, 'scale'),
+    tiles: numberParam(params, 'tiles'),
+    bench: params.get('bench') === '1',
+  }
+}
+
+function budgetFor(debug: DebugParams): AdaptiveBudget {
+  let opts = TV_BUDGET_OPTIONS
+  if (debug.scale !== null) opts = { ...opts, initialScale: debug.scale, minScale: debug.scale, maxScale: debug.scale }
+  if (debug.tiles !== null) opts = { ...opts, initialTiles: debug.tiles, minTiles: debug.tiles, maxTiles: debug.tiles }
+  return new AdaptiveBudget(opts)
 }
 
 function main(): void {
@@ -83,10 +119,12 @@ function main(): void {
   const canvas: HTMLCanvasElement = stage
 
   const renderer = createRenderer(canvas)
-  const adaptive = new AdaptiveResolution()
   const hud = new Hud(hudRoot)
   const palettes = new PaletteMixer()
   const debug = debugParams()
+  const budget = budgetFor(debug)
+  renderer.setQuality(budget)
+  renderer.setBenchmark(debug.bench)
   const tour = debug.custom ? new Tour([debug.custom]) : new Tour(undefined, debug.scene === null ? 0 : debug.scene)
   if (debug.custom) tour.seek(5)
   else if (debug.seek !== null) tour.seek(debug.seek)
@@ -95,23 +133,46 @@ function main(): void {
   let paused = false
   let colorShift = 0
   let lastTimestamp = performance.now()
+  let frameSeconds = 1 / 60
+  let averageFrameMs = 1000 / 60
 
   function applySize(): void {
-    const width = Math.max(1, Math.round(window.innerWidth * adaptive.scale))
-    const height = Math.max(1, Math.round(window.innerHeight * adaptive.scale))
-    renderer.setSize(width, height)
+    renderer.setSize(Math.max(1, window.innerWidth), Math.max(1, window.innerHeight))
+  }
+
+  function renderStats(): string {
+    const keyframe = renderer instanceof GlRenderer ? renderer.keyframeSize : null
+    const size = keyframe ? keyframe[0] + '×' + keyframe[1] : Math.round(budget.scale * 100) + '%'
+    return (
+      (renderer.kind === 'webgl' ? 'GPU ' : 'CPU ') +
+      canvas.width +
+      '×' +
+      canvas.height +
+      '  ·  keyframe ' +
+      size +
+      ' / ' +
+      budget.tiles +
+      ' frames  ·  ' +
+      averageFrameMs.toFixed(1) +
+      ' ms' +
+      (renderer.gpuMs === null ? '' : '  ·  gpu ' + renderer.gpuMs.toFixed(1) + ' ms')
+    )
   }
 
   function hudInfo(): void {
     const frame = tour.frame()
     const mode = frame.julia ? 'Julia' : 'Mandelbrot'
     const state = paused ? 'Paused' : SPEED_STEPS[speedIndex] + '×'
-    const res = canvas.width + '×' + canvas.height + ' ' + (renderer.kind === 'webgl' ? 'GPU' : 'CPU')
     hud.show({
       title: frame.sceneName,
-      subtitle: mode + '  ·  ' + palettes.current.name + '  ·  ' + state + '  ·  ' + res,
+      subtitle: mode + '  ·  ' + palettes.current.name + '  ·  ' + state + '  ·  ' + renderStats(),
       help: HELP_TEXT,
     })
+  }
+
+  function sceneChanged(): void {
+    palettes.cycle()
+    budget.invalidate()
   }
 
   function handle(action: RemoteAction): void {
@@ -125,11 +186,11 @@ function main(): void {
         return
       case 'left':
         tour.prev()
-        palettes.cycle()
+        sceneChanged()
         break
       case 'right':
         tour.next()
-        palettes.cycle()
+        sceneChanged()
         break
       case 'up':
         speedIndex = Math.min(SPEED_STEPS.length - 1, speedIndex + 1)
@@ -168,8 +229,7 @@ function main(): void {
     lastTimestamp = performance.now()
   })
 
-  function buildFrame(): FrameParams {
-    const scene = tour.frame()
+  function buildFrame(scene: SceneFrame): FrameParams {
     return {
       center: scene.center,
       scale: scene.scale,
@@ -177,6 +237,7 @@ function main(): void {
       maxIter: scene.maxIter,
       julia: scene.julia,
       seed: scene.seed,
+      sceneId: scene.sceneIndex,
       palette: palettes.blend(),
       colorShift,
       colorScale: scene.julia ? JULIA_COLOR_SCALE : MANDELBROT_COLOR_SCALE,
@@ -185,18 +246,24 @@ function main(): void {
     }
   }
 
+  function predict(aheadSeconds: number): FrameParams {
+    return buildFrame(tour.frameAt(paused ? 0 : aheadSeconds * SPEED_STEPS[speedIndex]))
+  }
+
   function loop(timestamp: number): void {
     const frameMs = timestamp - lastTimestamp
     lastTimestamp = timestamp
     const dt = Math.min(frameMs / 1000, MAX_FRAME_SECONDS)
+    frameSeconds += (dt - frameSeconds) * FRAME_INTERVAL_SMOOTHING
+    averageFrameMs += (Math.min(frameMs, 1000) - averageFrameMs) * FRAME_INTERVAL_SMOOTHING
     if (!paused) {
       const speed = SPEED_STEPS[speedIndex]
-      if (tour.update(dt * speed)) palettes.cycle()
+      if (tour.update(dt * speed)) sceneChanged()
       colorShift += dt * speed * COLOR_DRIFT_PER_SECOND
     }
     palettes.update(dt)
-    if (adaptive.record(frameMs)) applySize()
-    renderer.render(buildFrame())
+    if (budget.record(frameMs, timestamp)) renderer.setQuality(budget)
+    renderer.render(buildFrame(tour.frame()), predict, frameSeconds)
     window.requestAnimationFrame(loop)
   }
 

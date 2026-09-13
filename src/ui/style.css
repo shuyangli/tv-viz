@@ -12,7 +12,7 @@ body {
   display: block;
   width: 100vw;
   height: 100vh;
-  /* Upscaling a lower internal resolution; bilinear keeps it soft rather than blocky. */
+  /* The canvas matches the viewport; keyframes at lower resolution are resampled in the shader. */
   image-rendering: auto;
 }
 

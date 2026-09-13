@@ -84,4 +84,33 @@ export class PaletteMixer {
   }
 }
 
+/**
+ * Smallest integer period (in t) shared by every cosine frequency in the blend, so a
+ * lookup table over one period tiles seamlessly. Frequencies here are multiples of 0.1,
+ * so the search always succeeds; the fallback of 1 only matters for palettes added later.
+ */
+export function palettePeriod(blend: PaletteBlend, maxPeriod = 100): number {
+  const freqs = [...blend.from.c, ...blend.to.c]
+  for (let p = 1; p <= maxPeriod; p++) {
+    if (freqs.every((c) => Math.abs(c * p - Math.round(c * p)) < 1e-6)) return p
+  }
+  return 1
+}
+
+/** Samples the blended palette over one period into RGBA bytes, for a 1-D lookup texture. */
+export function bakePaletteLut(blend: PaletteBlend, period: number, size: number, out: Uint8Array): void {
+  for (let i = 0; i < size; i++) {
+    const t = (i * period) / size
+    const rgb = mixVec3(evalPalette(blend.from, t), evalPalette(blend.to, t), blend.mix)
+    out[i * 4] = toByte(rgb[0])
+    out[i * 4 + 1] = toByte(rgb[1])
+    out[i * 4 + 2] = toByte(rgb[2])
+    out[i * 4 + 3] = 255
+  }
+}
+
+function toByte(v: number): number {
+  return v <= 0 ? 0 : v >= 1 ? 255 : Math.round(v * 255)
+}
+
 export type { Vec2 }
