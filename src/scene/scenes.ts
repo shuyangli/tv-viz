@@ -1,15 +1,16 @@
 import { TWO_PI, type Vec2 } from './math'
+import { classify, solveMisiurewicz, type MisiurewiczPoint } from './misiurewicz'
 import { OVERVIEW_SCALE } from './quality'
 
+/**
+ * An endless zoom toward a Misiurewicz point. The point is pinned down exactly at load
+ * time from a nearby guess and its preperiod and period, so the scene definition stays
+ * readable while the renderer gets the orbit to full double precision.
+ */
 export interface DiveScene {
   readonly kind: 'dive'
   readonly name: string
-  readonly target: Vec2
-  readonly targetScale: number
-  readonly zoomInSeconds: number
-  readonly holdSeconds: number
-  /** 0 fades to black at depth instead of zooming back out. */
-  readonly zoomOutSeconds: number
+  readonly point: MisiurewiczPoint
   /** Radians per second of continuous rotation. */
   readonly spin: number
 }
@@ -30,22 +31,15 @@ export type Scene = DiveScene | JuliaScene
 
 const DEFAULT_SPIN = 0.015
 
-function dive(
-  name: string,
-  target: Vec2,
-  targetScale: number,
-  timing: { zoomIn?: number; hold?: number; zoomOut?: number; spin?: number } = {},
-): DiveScene {
-  return {
-    kind: 'dive',
-    name,
-    target,
-    targetScale,
-    zoomInSeconds: timing.zoomIn === undefined ? 75 : timing.zoomIn,
-    holdSeconds: timing.hold === undefined ? 20 : timing.hold,
-    zoomOutSeconds: timing.zoomOut === undefined ? 40 : timing.zoomOut,
-    spin: timing.spin === undefined ? DEFAULT_SPIN : timing.spin,
-  }
+export function resolveMisiurewicz(guess: Vec2, preperiod: number, period: number): MisiurewiczPoint {
+  const root = solveMisiurewicz(guess, preperiod, period)
+  const point = root && classify(root)
+  if (!point) throw new Error('No Misiurewicz point near ' + guess[0] + ', ' + guess[1])
+  return point
+}
+
+function dive(name: string, guess: Vec2, preperiod: number, period: number, spin = DEFAULT_SPIN): DiveScene {
+  return { kind: 'dive', name, point: resolveMisiurewicz(guess, preperiod, period), spin }
 }
 
 /**
@@ -94,24 +88,30 @@ function julia(
   return { kind: 'julia', name, durationSeconds, seedPath, scale, spin, iterations: JULIA_ITERATIONS }
 }
 
+/**
+ * Dive guesses come from the spiral centres of the earlier finite tours plus a survey of
+ * the boundary for cycles with a comfortable multiplier; the multiplier sets how many
+ * extra iterations every zoom doubling costs, so very tight spirals (|λ| near 1) are
+ * left out.
+ */
 export const SCENES: readonly Scene[] = [
-  dive('Seahorse Valley', [-0.743643887037151, 0.13182590420533], 3e-4),
+  dive('Seahorse Valley', [-0.74329189085243, 0.131240552308798], 24, 2),
   julia('Cardioid Walk', (u) => cardioidSeed(0.15 * TWO_PI + 0.35 * TWO_PI * u, CARDIOID_RADIUS), 120),
-  dive('Elephant Valley', [0.2795, 0.0093], 6e-4, { zoomOut: 0 }),
+  dive('Misiurewicz Spiral', [-0.775683768009054, 0.13646736829469], 24, 1),
   julia('Dendrite Drift', segment([-0.1, 0.9], [0.05, 1.02]), 80, 1.6),
-  dive('Crown Satellite', [-0.1592, 1.0317], 4e-3, { zoomIn: 60, hold: 25 }),
+  dive('Twin Spiral', [-0.13884173834, 1.004163060447], 10, 4),
   julia('Spiral Eyes', segment([-0.4, 0.6], [-0.5, 0.56]), 110, 1.5),
-  dive('Satellite', [-1.7548776662, 0.0], 8e-3, { zoomIn: 55, hold: 25, zoomOut: 0 }),
+  dive('Double Spiral', [-0.74515806380162, 0.112574916205416], 28, 2),
   julia('Rabbit to Dragon', segment([-0.123, 0.745], [-0.8, 0.156]), 100, 1.55),
-  dive('Quad Spiral', [0.32450464, 0.04855101], 4e-4, { zoomIn: 70 }),
+  dive('Branch Point', [-0.46230642218, 0.630743988029], 12, 1),
   julia('Siegel Spiral', segment([-0.390541, -0.586788], [-0.4, -0.59]), 70, 1.5, 0.03),
-  dive('Double Spiral', [-0.7453, 0.1127], 5e-4, { zoomIn: 65, zoomOut: 0 }),
+  dive('Top Spiral', [-0.101096363845622, 0.956286510809142], 4, 1),
   julia('Southern Walk', (u) => cardioidSeed(0.55 * TWO_PI + 0.3 * TWO_PI * u, CARDIOID_RADIUS), 110),
-  dive('Misiurewicz Spiral', [-0.77568377, 0.13646737], 5e-4, { zoomIn: 70, hold: 25 }),
+  dive('Triple Arm', [0.252103892669, 0.589703407776], 10, 3),
   julia('Dragon Coast', segment([-0.8, 0.156], [-0.7269, 0.1889]), 90, 1.5),
-  dive('Antenna Branches', [-1.25066, 0.02012], 5e-4, { zoomIn: 70, zoomOut: 0 }),
+  dive('Dendrite Coast', [0.00164295554715, -0.822466530019091], 7, 1),
   julia('Lightning', segment([0.0, 1.0], [0.0, 0.94]), 80, 1.6, 0.02),
-  dive('Dendrite Coast', [0.001643721971153, -0.822467633298876], 5e-4, { zoomIn: 75 }),
+  dive('Fork', [-0.252961547265, 0.849973842324], 11, 3),
 ]
 
 export const OVERVIEW: Vec2 = [-0.6, 0]

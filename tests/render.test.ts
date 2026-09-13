@@ -1,7 +1,10 @@
 import { describe, expect, it } from 'vitest'
 import { escapeTime } from '../src/render/cpu'
-import { keyframeShaderSource, presentShaderSource } from '../src/render/shaders'
-import { MAX_ITERATIONS } from '../src/scene/quality'
+import { planSkip } from '../src/render/gl'
+import { directShaderSource, diveShaderSource, presentShaderSource } from '../src/render/shaders'
+import { perturbationConstants } from '../src/scene/misiurewicz'
+import { HANDOFF_BITS, MAX_ITERATIONS } from '../src/scene/quality'
+import { SCENES, type DiveScene } from '../src/scene/scenes'
 
 describe('escapeTime', () => {
   it('reports the origin as inside the Mandelbrot set', () => {
@@ -70,30 +73,58 @@ describe('unrolled escape loop', () => {
   })
 })
 
+const dive = SCENES.find((scene): scene is DiveScene => scene.kind === 'dive') as DiveScene
+
 describe('shader sources', () => {
-  it('bakes an even iteration cap in as a compile-time constant for the two-step loop', () => {
+  it('bakes an even iteration cap in as a compile-time constant for the two-step direct loop', () => {
     expect(MAX_ITERATIONS % 2).toBe(0)
-    for (const julia of [false, true]) {
-      const src = keyframeShaderSource(julia)
+    for (const julia of [true, false]) {
+      const src = directShaderSource(julia)
       expect(src).toContain(`const int MAX_ITER = ${MAX_ITERATIONS};`)
       expect(src).toContain('i += 2')
       expect(src.trim().startsWith('precision highp float;')).toBe(true)
     }
+    expect(directShaderSource(true)).toContain('trap = min(trap')
+    expect(directShaderSource(false)).not.toContain('trap = min(trap')
+    expect(directShaderSource(false)).toContain('insideMainBody')
   })
 
-  it('only tracks the orbit trap and shades interiors in the Julia variant', () => {
-    expect(keyframeShaderSource(true)).toContain('trap = min(trap')
-    expect(keyframeShaderSource(false)).not.toContain('trap = min(trap')
-    expect(keyframeShaderSource(false)).toContain('insideMainBody')
-    expect(keyframeShaderSource(true)).not.toContain('insideMainBody')
+  it('bakes the reference orbit into the dive shader, one step per orbit entry', () => {
+    const src = diveShaderSource(dive.point)
+    // Two copies of the loop (with and without the deep-zoom-zero dc term), short cycles
+    // repeated so the body has at least four steps.
+    const repeats = Math.max(1, Math.ceil(4 / dive.point.period))
+    const steps = src.match(/d = vec2\(d\.x \* w\.x/g) || []
+    expect(steps.length).toBe(2 * (dive.point.preperiod + repeats * dive.point.period))
+    expect(src).toContain(`const int PREPERIOD = ${dive.point.preperiod};`)
+    expect(src).toContain(`const int PERIOD = ${dive.point.period};`)
+    expect(src).toContain('insideMainBody')
   })
 
   it('does not use GLSL ES 3.00 syntax so it compiles on WebGL1', () => {
-    for (const src of [keyframeShaderSource(false), keyframeShaderSource(true), presentShaderSource()]) {
+    for (const src of [directShaderSource(true), directShaderSource(false), diveShaderSource(dive.point), presentShaderSource()]) {
       expect(src).not.toMatch(/\bin\s+vec/)
       expect(src).not.toMatch(/\bout\s+vec/)
       expect(src).not.toContain('#version')
       expect(src).not.toContain('texture(')
     }
+  })
+})
+
+describe('planSkip', () => {
+  it('lands a pixel one view unit from the anchor within one cycle of the handoff magnitude', () => {
+    const constants = perturbationConstants(dive.point)
+    for (const log2Scale of [0.4, -10, -40, -300, -5000]) {
+      const skip = planSkip(log2Scale, constants)
+      expect(skip.mant).toBeGreaterThanOrEqual(1)
+      expect(skip.mant).toBeLessThan(2)
+      expect(skip.mant * Math.pow(2, -skip.k0)).toBeCloseTo(Math.pow(2, log2Scale), 12)
+      expect(skip.log2Mag0).toBeLessThanOrEqual(-HANDOFF_BITS)
+      expect(skip.log2Mag0).toBeGreaterThan(-HANDOFF_BITS - constants.log2Lambda)
+      expect(skip.phase0).toBeGreaterThanOrEqual(0)
+      expect(skip.phase0).toBeLessThan(2 * Math.PI)
+    }
+    expect(planSkip(0.4, constants).j0).toBeLessThan(1)
+    expect(planSkip(-5000, constants).j0).toBeGreaterThan(1000)
   })
 })

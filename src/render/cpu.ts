@@ -1,5 +1,6 @@
 import { smoothstep } from '../scene/math'
 import { evalPalette, mixVec3 } from '../scene/palette'
+import { cameraCenter } from './keyframe'
 import type { FrameParams, Renderer } from './types'
 
 /** Escape-time rendering in JavaScript is slow, so the fallback works at a small fixed size and lets the canvas upscale it. */
@@ -8,7 +9,11 @@ const BAILOUT_SQ = 256
 const TRAP_COLOR_SCALE = 1.5
 const INTERIOR_BRIGHTNESS = 0.7
 
-/** Last-resort renderer when WebGL is unavailable. Same maths as the shader, minus the vignette. */
+/**
+ * Last-resort renderer when WebGL is unavailable. Same maths as the Julia shader, minus
+ * the vignette, iterating from absolute coordinates; dives therefore lose detail once
+ * they pass single-precision depth.
+ */
 export class CpuRenderer implements Renderer {
   readonly kind = 'cpu'
   private readonly ctx: CanvasRenderingContext2D
@@ -48,13 +53,15 @@ export class CpuRenderer implements Renderer {
     const data = this.image.data
     const cs = Math.cos(frame.rotation)
     const sn = Math.sin(frame.rotation)
+    const scale = Math.pow(2, frame.log2Scale)
+    const center = cameraCenter(frame)
     let offset = 0
     for (let py = 0; py < height; py++) {
       for (let px = 0; px < width; px++) {
-        const ux = ((px + 0.5 - width / 2) / height) * 2 * frame.scale
-        const uy = ((height / 2 - (py + 0.5)) / height) * 2 * frame.scale
-        const x = frame.center[0] + ux * cs - uy * sn
-        const y = frame.center[1] + ux * sn + uy * cs
+        const ux = ((px + 0.5 - width / 2) / height) * 2 * scale
+        const uy = ((height / 2 - (py + 0.5)) / height) * 2 * scale
+        const x = center[0] + ux * cs - uy * sn
+        const y = center[1] + ux * sn + uy * cs
         const orbit = frame.julia
           ? escapeTime(x, y, frame.seed[0], frame.seed[1], frame.maxIter)
           : escapeTime(0, 0, x, y, frame.maxIter)

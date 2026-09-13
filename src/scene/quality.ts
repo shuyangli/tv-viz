@@ -1,28 +1,48 @@
+import type { MisiurewiczPoint } from './misiurewicz'
 import { clamp } from './math'
 
 /**
- * Hard loop bound compiled into the shader. The CX's Mali-G51 manages roughly 2 billion
- * iterations per second; at this ceiling a 1080p keyframe of a deep zoom takes about
- * 100 ms, which spread over 6–8 frames leaves the display at 60 fps. Must be even: the
- * shader loop is unrolled by two.
+ * Hard loop bound compiled into the shaders. For dives it caps the iterations a pixel
+ * runs after the closed-form skip, so per-pixel cost is independent of zoom depth; for
+ * Julia sets it is the plain iteration cap. Must be even: the Julia loop is unrolled by two.
  */
-export const MAX_ITERATIONS = 300
-export const MIN_ITERATIONS = 80
+export const MAX_ITERATIONS = 1024
 
 /** Half-height of the viewport in complex units when showing the whole Mandelbrot set. */
 export const OVERVIEW_SCALE = 1.35
 export const OVERVIEW_CENTER: readonly [number, number] = [-0.6, 0]
 
 /**
- * Single-precision floats give about 7 significant digits. Below this scale, adjacent
- * pixels near |c| ~ 1 land on the same float and the image turns into blocks.
+ * Pixels leave the closed-form regime once their orbit offset reaches 2^-HANDOFF_BITS of
+ * the reference orbit's scale. The handoff uses a KOENIGS_ORDER-term series, so the
+ * truncation error is about (2^-HANDOFF_BITS / r)^(KOENIGS_ORDER+1) with r the series'
+ * radius of convergence; the misiurewicz tests check it against the exact recurrence.
  */
-export const MIN_SCALE = 1e-4
+export const HANDOFF_BITS = 6
+export const KOENIGS_ORDER = 5
+/**
+ * Above this depth (in doublings) the pixel offset δc is so small that its own terms in
+ * the orbit dynamics vanish and the series applies; shallower views iterate from scratch,
+ * which is cheap there anyway.
+ */
+export const MIN_SKIP_DEPTH = 16
+/** Iterations allowed beyond the handoff for the visible boundary detail. */
+const TAIL_ITERATIONS = 192
 
-const ITERATIONS_PER_ZOOM_DOUBLING = 32
+/**
+ * Iteration cap for the direct shader during a dive's first doublings, before the
+ * perturbation path takes over at MIN_SKIP_DEPTH.
+ */
+export function directIterations(depth: number): number {
+  return Math.round(clamp(100 + 32 * Math.max(0, depth), 100, MAX_ITERATIONS))
+}
 
-export function iterationsForScale(scale: number): number {
-  const doublings = Math.log2(OVERVIEW_SCALE / Math.max(scale, MIN_SCALE))
-  const wanted = MIN_ITERATIONS + ITERATIONS_PER_ZOOM_DOUBLING * Math.max(doublings, 0)
-  return Math.round(clamp(wanted, MIN_ITERATIONS, MAX_ITERATIONS))
+/**
+ * Iterations a dive pixel may run after the skip. Growing from the handoff to escape takes
+ * about HANDOFF_BITS * period / log2|λ| iterations, so weakly repelling cycles cost more.
+ */
+export function diveIterations(point: MisiurewiczPoint): number {
+  const log2Lambda = Math.log2(Math.hypot(point.multiplier[0], point.multiplier[1]))
+  const growth = (HANDOFF_BITS * point.period) / log2Lambda
+  return Math.round(clamp(growth + TAIL_ITERATIONS, 64, MAX_ITERATIONS))
 }

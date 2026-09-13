@@ -1,16 +1,13 @@
 import { describe, expect, it } from 'vitest'
-import { OVERVIEW_CENTER, OVERVIEW_SCALE, MIN_SCALE, MAX_ITERATIONS, MIN_ITERATIONS, iterationsForScale } from '../src/scene/quality'
-import { SCENES, cardioidSeed, type DiveScene, type JuliaScene } from '../src/scene/scenes'
-import { sceneDuration, Tour } from '../src/scene/tour'
+import { OVERVIEW_CENTER, OVERVIEW_SCALE } from '../src/scene/quality'
+import { cameraCenter } from '../src/render/keyframe'
+import { resolveMisiurewicz, SCENES, cardioidSeed, type DiveScene, type JuliaScene } from '../src/scene/scenes'
+import { diveDepth, sceneDuration, Tour, ZOOM_DOUBLINGS_PER_SECOND } from '../src/scene/tour'
 
 const dive: DiveScene = {
   kind: 'dive',
   name: 'test dive',
-  target: [-0.75, 0.1],
-  targetScale: 1e-3,
-  zoomInSeconds: 10,
-  holdSeconds: 4,
-  zoomOutSeconds: 6,
+  point: resolveMisiurewicz([-0.1, 0.95], 4, 1),
   spin: 0,
 }
 
@@ -25,69 +22,68 @@ const julia: JuliaScene = {
 }
 
 describe('Tour dive', () => {
-  it('starts at the overview and reaches the target scale at the end of the zoom', () => {
+  it('starts framed like the overview', () => {
     const tour = new Tour([dive])
     const start = tour.frame()
-    expect(start.scale).toBeCloseTo(OVERVIEW_SCALE)
-    expect(start.center[0]).toBeCloseTo(OVERVIEW_CENTER[0])
-    expect(start.center[1]).toBeCloseTo(OVERVIEW_CENTER[1])
+    expect(start.log2Scale).toBeCloseTo(Math.log2(OVERVIEW_SCALE))
+    const centre = cameraCenter(start)
+    expect(centre[0]).toBeCloseTo(OVERVIEW_CENTER[0])
+    expect(centre[1]).toBeCloseTo(OVERVIEW_CENTER[1])
+    expect(start.anchor).toEqual(dive.point.c)
+    expect(start.reference).toBe(dive.point)
     expect(start.phase).toBe('in')
-
-    tour.seek(dive.zoomInSeconds)
-    const deep = tour.frame()
-    expect(deep.scale).toBeCloseTo(dive.targetScale, 6)
-    expect(deep.center[0]).toBeCloseTo(dive.target[0], 3)
-    expect(deep.center[1]).toBeCloseTo(dive.target[1], 3)
-    expect(deep.phase).toBe('hold')
   })
 
-  it('keeps the target at the same screen position throughout the zoom', () => {
+  it('zooms at a constant rate in log space forever', () => {
     const tour = new Tour([dive])
-    const screenOffset = (t: number): [number, number] => {
-      tour.seek(t)
-      const f = tour.frame()
-      return [(dive.target[0] - f.center[0]) / f.scale, (dive.target[1] - f.center[1]) / f.scale]
-    }
-    const early = screenOffset(1)
-    const late = screenOffset(9)
-    expect(early[0]).toBeCloseTo(late[0], 6)
-    expect(early[1]).toBeCloseTo(late[1], 6)
+    tour.seek(100)
+    expect(tour.frame().log2Scale).toBeCloseTo(Math.log2(OVERVIEW_SCALE) - 100 * ZOOM_DOUBLINGS_PER_SECOND)
+    tour.seek(1e5)
+    expect(tour.frame().log2Scale).toBeCloseTo(Math.log2(OVERVIEW_SCALE) - diveDepth(1e5))
+    expect(sceneDuration(dive)).toBe(Infinity)
   })
 
-  it('zooms back out to the overview', () => {
+  it('slides the point to the screen centre over the first doublings and keeps it there', () => {
     const tour = new Tour([dive])
-    tour.seek(sceneDuration(dive) - 1e-6)
-    expect(tour.frame().phase).toBe('out')
-    expect(tour.frame().scale).toBeCloseTo(OVERVIEW_SCALE, 3)
+    expect(Math.hypot(...tour.frame().offset)).toBeGreaterThan(0.1)
+    tour.seek(200)
+    expect(Math.hypot(...tour.frame().offset)).toBe(0)
   })
 
-  it('fades to black at the scene boundaries', () => {
+  it('fades in from black and never fades out', () => {
     const tour = new Tour([dive])
     expect(tour.frame().brightness).toBe(0)
     tour.seek(1)
     expect(tour.frame().brightness).toBeCloseTo(0.5)
-    tour.seek(10)
+    tour.seek(1e6)
     expect(tour.frame().brightness).toBe(1)
-    tour.seek(sceneDuration(dive) - 0.5)
-    expect(tour.frame().brightness).toBeCloseTo(0.25)
   })
 
-  it('never goes below the float precision floor', () => {
-    const tour = new Tour([{ ...dive, targetScale: 1e-9 }])
-    tour.seek(dive.zoomInSeconds)
-    expect(tour.frame().scale).toBeGreaterThanOrEqual(MIN_SCALE * (1 - 0.13))
+  it('never restarts on its own', () => {
+    const tour = new Tour([dive, julia])
+    expect(tour.update(1e6)).toBe(false)
+    expect(tour.sceneIndex).toBe(0)
   })
 })
 
 describe('Tour sequencing', () => {
-  it('advances to the next scene when the current one ends and wraps around', () => {
-    const tour = new Tour([dive, julia])
-    expect(tour.update(sceneDuration(dive) - 1)).toBe(false)
-    expect(tour.update(1)).toBe(true)
-    expect(tour.sceneIndex).toBe(1)
-    expect(tour.frame().julia).toBe(true)
-    expect(tour.update(sceneDuration(julia))).toBe(true)
+  it('restarts a looping scene when it ends instead of advancing', () => {
+    const tour = new Tour([julia, dive])
+    const epoch = tour.epoch
+    expect(tour.update(sceneDuration(julia) - 1)).toBe(false)
+    expect(tour.update(1.5)).toBe(true)
     expect(tour.sceneIndex).toBe(0)
+    expect(tour.elapsed).toBeCloseTo(0.5)
+    expect(tour.epoch).toBe(epoch + 1)
+  })
+
+  it('changes epoch on manual scene switches so stale keyframes are dropped', () => {
+    const tour = new Tour([dive, julia])
+    const epoch = tour.epoch
+    tour.next()
+    expect(tour.epoch).toBe(epoch + 1)
+    expect(tour.frame().epoch).toBe(epoch + 1)
+    expect(tour.frame().julia).toBe(true)
   })
 
   it('walks the Julia seed along its path', () => {
@@ -108,9 +104,10 @@ describe('Tour sequencing', () => {
     expect(tour.elapsed).toBe(0)
   })
 
-  it('uses the Julia scene iteration budget instead of the zoom-based one', () => {
+  it('uses the Julia scene iteration budget', () => {
     const tour = new Tour([julia])
     expect(tour.frame().maxIter).toBe(250)
+    expect(tour.frame().reference).toBeNull()
   })
 
   it('accumulates rotation from the scene spin', () => {
@@ -120,21 +117,17 @@ describe('Tour sequencing', () => {
   })
 })
 
-describe('iterationsForScale', () => {
-  it('uses more iterations as the zoom deepens, within bounds', () => {
-    expect(iterationsForScale(OVERVIEW_SCALE)).toBe(MIN_ITERATIONS)
-    expect(iterationsForScale(OVERVIEW_SCALE / 4)).toBeGreaterThan(MIN_ITERATIONS)
-    expect(iterationsForScale(1e-12)).toBe(MAX_ITERATIONS)
-  })
-})
-
 describe('scene library', () => {
-  it('alternates Mandelbrot dives with Julia sets and stays above the precision floor', () => {
+  it('alternates endless dives with Julia sets, every dive on a resolved Misiurewicz point', () => {
     for (let i = 0; i < SCENES.length; i++) {
       const scene = SCENES[i]
       expect(scene.kind).toBe(i % 2 === 0 ? 'dive' : 'julia')
-      if (scene.kind === 'dive') expect(scene.targetScale).toBeGreaterThanOrEqual(MIN_SCALE)
-      expect(sceneDuration(scene)).toBeGreaterThan(0)
+      if (scene.kind === 'dive') {
+        expect(scene.point.preperiod).toBeGreaterThan(0)
+        expect(Math.hypot(...scene.point.multiplier)).toBeGreaterThan(1)
+      } else {
+        expect(sceneDuration(scene)).toBeGreaterThan(0)
+      }
     }
   })
 

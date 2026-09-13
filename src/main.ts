@@ -5,6 +5,8 @@ import { GlRenderer } from './render/gl'
 import type { FrameParams, Renderer } from './render/types'
 import type { SceneFrame } from './scene/tour'
 import { PaletteMixer } from './scene/palette'
+import { nearestMisiurewicz } from './scene/misiurewicz'
+import { OVERVIEW_SCALE } from './scene/quality'
 import type { Scene } from './scene/scenes'
 import { Tour } from './scene/tour'
 import { Hud } from './ui/hud'
@@ -35,7 +37,7 @@ function createRenderer(canvas: HTMLCanvasElement): Renderer {
 interface DebugParams {
   readonly scene: number | null
   readonly seek: number | null
-  /** `?cx=&cy=&s=` pins the camera on a custom Mandelbrot point, `?jx=&jy=` on a custom Julia seed, for scouting new scenes. */
+  /** `?cx=&cy=` dives toward the Misiurewicz point nearest that guess, `?jx=&jy=&s=` shows a custom Julia seed, for scouting new scenes. */
   readonly custom: Scene | null
   /** `?scale=` and `?tiles=` each pin one knob of the render budget while the other adapts, for measuring on the TV. */
   readonly scale: number | null
@@ -84,16 +86,9 @@ function debugParams(): DebugParams {
       iterations: 300,
     }
   } else if (cx !== null && cy !== null) {
-    custom = {
-      kind: 'dive',
-      name: 'Custom ' + cx + ', ' + cy,
-      target: [cx, cy],
-      targetScale: s === null ? 1e-3 : s,
-      zoomInSeconds: 1,
-      holdSeconds: 1e9,
-      zoomOutSeconds: 0,
-      spin: 0,
-    }
+    // Dives need a boundary point with a finite orbit, so scout the nearest one.
+    const point = nearestMisiurewicz([cx, cy], 40, 6, 0.05)
+    if (point) custom = { kind: 'dive', name: 'Custom ' + point.c[0].toFixed(6) + ', ' + point.c[1].toFixed(6), point, spin: 0 }
   }
   return {
     scene: numberParam(params, 'scene'),
@@ -135,6 +130,7 @@ function main(): void {
   let lastTimestamp = performance.now()
   let frameSeconds = 1 / 60
   let averageFrameMs = 1000 / 60
+  let renderFailed = false
 
   function applySize(): void {
     renderer.setSize(Math.max(1, window.innerWidth), Math.max(1, window.innerHeight))
@@ -161,7 +157,8 @@ function main(): void {
 
   function hudInfo(): void {
     const frame = tour.frame()
-    const mode = frame.julia ? 'Julia' : 'Mandelbrot'
+    const zoom = (Math.log2(OVERVIEW_SCALE) - frame.log2Scale) * Math.LOG10E * Math.LN2
+    const mode = frame.julia ? 'Julia' : 'Mandelbrot ×10^' + zoom.toFixed(1)
     const state = paused ? 'Paused' : SPEED_STEPS[speedIndex] + '×'
     hud.show({
       title: frame.sceneName,
@@ -231,13 +228,15 @@ function main(): void {
 
   function buildFrame(scene: SceneFrame): FrameParams {
     return {
-      center: scene.center,
-      scale: scene.scale,
+      anchor: scene.anchor,
+      offset: scene.offset,
+      log2Scale: scene.log2Scale,
       rotation: scene.rotation,
       maxIter: scene.maxIter,
       julia: scene.julia,
       seed: scene.seed,
-      sceneId: scene.sceneIndex,
+      reference: scene.reference,
+      sceneId: scene.epoch,
       palette: palettes.blend(),
       colorShift,
       colorScale: scene.julia ? JULIA_COLOR_SCALE : MANDELBROT_COLOR_SCALE,
@@ -258,12 +257,18 @@ function main(): void {
     averageFrameMs += (Math.min(frameMs, 1000) - averageFrameMs) * FRAME_INTERVAL_SMOOTHING
     if (!paused) {
       const speed = SPEED_STEPS[speedIndex]
-      if (tour.update(dt * speed)) sceneChanged()
+      if (tour.update(dt * speed)) palettes.cycle()
       colorShift += dt * speed * COLOR_DRIFT_PER_SECOND
     }
     palettes.update(dt)
     if (budget.record(frameMs, timestamp)) renderer.setQuality(budget)
-    renderer.render(buildFrame(tour.frame()), predict, frameSeconds)
+    try {
+      renderer.render(buildFrame(tour.frame()), predict, frameSeconds)
+    } catch (error) {
+      // A rendering fault must not stop the loop; the next scene may well be fine.
+      if (!renderFailed) console.error(String(error))
+      renderFailed = true
+    }
     window.requestAnimationFrame(loop)
   }
 

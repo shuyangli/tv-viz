@@ -1,19 +1,27 @@
-import type { Vec2 } from '../scene/math'
+import { TWO_PI, type Vec2 } from '../scene/math'
+import { perturbationConstants, type MisiurewiczPoint, type PerturbationConstants } from '../scene/misiurewicz'
 import { bakePaletteLut, palettePeriod, type PaletteBlend } from '../scene/palette'
-import { planKeyframe, reproject, type Camera, type KeyframeLayout } from './keyframe'
-import { keyframeShaderSource, presentShaderSource, VERTEX_SHADER } from './shaders'
+import { directIterations, HANDOFF_BITS, MAX_ITERATIONS, MIN_SKIP_DEPTH, OVERVIEW_SCALE } from '../scene/quality'
+import { cameraCenter, planKeyframe, reproject, type Camera, type KeyframeLayout } from './keyframe'
+import { directShaderSource, diveShaderSource, presentShaderSource, VERTEX_SHADER } from './shaders'
 import type { FrameParams, Predict, Renderer, RenderQuality } from './types'
 
-const KEYFRAME_UNIFORMS = [
-  'u_center',
-  'u_rot',
-  'u_unitsPerTexel',
-  'u_texCenter',
+const TILE_UNIFORMS = ['u_tile', 'u_rowsPerTile', 'u_tiles', 'u_texCenter', 'u_rot'] as const
+
+const DIRECT_UNIFORMS = [...TILE_UNIFORMS, 'u_center', 'u_unitsPerTexel', 'u_maxIter', 'u_seed', 'u_nRange'] as const
+
+const DIVE_UNIFORMS = [
+  ...TILE_UNIFORMS,
+  'u_offset',
+  'u_texelToView',
+  'u_k0',
+  'u_mant',
+  'u_j0',
+  'u_log2Mag0',
+  'u_phase0',
+  'u_nBase',
+  'u_nRange',
   'u_maxIter',
-  'u_seed',
-  'u_tile',
-  'u_rowsPerTile',
-  'u_tiles',
 ] as const
 
 const PRESENT_UNIFORMS = [
@@ -27,6 +35,9 @@ const PRESENT_UNIFORMS = [
   'u_offset',
   'u_resolutionInv',
   'u_julia',
+  'u_nRange',
+  'u_nBase',
+  'u_nBaseWrapped',
   'u_colorShift',
   'u_colorScaleInv',
   'u_lutPeriodInv',
@@ -42,9 +53,15 @@ interface Program<Names extends readonly string[]> {
 }
 
 interface Programs {
-  readonly mandelbrot: Program<typeof KEYFRAME_UNIFORMS>
-  readonly julia: Program<typeof KEYFRAME_UNIFORMS>
+  readonly vertex: WebGLShader
+  readonly julia: Program<typeof DIRECT_UNIFORMS>
+  readonly mandelbrot: Program<typeof DIRECT_UNIFORMS>
   readonly present: Program<typeof PRESENT_UNIFORMS>
+}
+
+interface DiveProgram {
+  readonly program: Program<typeof DIVE_UNIFORMS>
+  readonly constants: PerturbationConstants
 }
 
 interface Target {
@@ -54,13 +71,29 @@ interface Target {
   readonly height: number
 }
 
+/** Per-keyframe inputs to the closed-form skip in the dive shader. */
+interface Skip {
+  readonly k0: number
+  readonly mant: number
+  readonly j0: number
+  readonly log2Mag0: number
+  readonly phase0: number
+}
+
 interface Keyframe {
   readonly camera: Camera
   readonly layout: KeyframeLayout
   readonly sceneId: number
   readonly julia: boolean
+  /** Perturbation only pays off deep in a dive; shallower views use the direct shader. */
+  readonly perturbed: boolean
   readonly maxIter: number
   readonly seed: Vec2
+  readonly reference: MisiurewiczPoint | null
+  readonly skip: Skip | null
+  /** Iteration count the stored values are relative to, and their half-range. */
+  readonly nBase: number
+  readonly nRange: number
   readonly target: Target
   /** Next tile to render; equals layout.tiles once complete. */
   tile: number
@@ -70,8 +103,8 @@ interface Keyframe {
 const FULLSCREEN_TRIANGLE = new Float32Array([-1, -1, 3, -1, -1, 3])
 
 /**
- * Keyframes are allocated once at this multiple of the canvas so a zooming-out camera has
- * pixels beyond the screen edge to sample. Per-keyframe cover beyond this is clamped.
+ * Keyframes are allocated once at this multiple of the viewport so a zooming-out camera
+ * has pixels beyond the screen edge to sample. Per-keyframe cover beyond this is clamped.
  */
 const MAX_COVER = 1.1
 /** Extra half-extent, on top of the predicted zoom range, for rotation and drift. */
@@ -100,11 +133,14 @@ interface PaletteLut {
  * fractal pass renders into an offscreen keyframe spread over several frames; every
  * displayed frame reprojects the newest complete keyframe through the current camera
  * and applies the palette, so motion stays at the display rate while the GPU spends
- * only a fraction of a fractal per frame.
+ * only a fraction of a fractal per frame. Dives use a perturbation shader compiled per
+ * Misiurewicz point, so zoom depth is unbounded.
  */
 export class GlRenderer implements Renderer {
   readonly kind = 'webgl'
   private programs: Programs | null = null
+  /** null marks a point whose shader this GPU's compiler rejected; such dives present black instead of crashing the loop. */
+  private readonly divePrograms = new Map<MisiurewiczPoint, DiveProgram | null>()
   private targets: readonly [Target, Target] | null = null
   private front: Keyframe | null = null
   private back: Keyframe | null = null
@@ -124,6 +160,7 @@ export class GlRenderer implements Renderer {
       event.preventDefault()
       this.contextLost = true
       this.programs = null
+      this.divePrograms.clear()
       this.targets = null
       this.lut = null
       this.front = null
@@ -241,25 +278,47 @@ export class GlRenderer implements Renderer {
     const first = predict(tiles * frameSeconds)
     const mid = predict((1.5 * tiles - 0.5) * frameSeconds)
     const last = predict((2 * tiles - 1) * frameSeconds)
-    const coverScale = Math.max(first.scale, mid.scale, last.scale) * (1 + COVER_MARGIN)
+    const coverLog2 = Math.max(first.log2Scale, mid.log2Scale, last.log2Scale) + Math.log2(1 + COVER_MARGIN)
     const target = this.front && this.front.target === targets[0] ? targets[1] : targets[0]
     const layout = planKeyframe(
       this.viewportWidth,
       this.viewportHeight,
       scale,
-      mid.scale,
-      coverScale,
+      mid.log2Scale,
+      coverLog2,
       tiles,
       target.width,
       target.height,
     )
+    const camera: Camera = { anchor: mid.anchor, offset: mid.offset, log2Scale: mid.log2Scale, rotation: mid.rotation }
+    let skip: Skip | null = null
+    let nBase = 0
+    let nRange = MAX_ITERATIONS
+    let maxIter = mid.maxIter
+    const depth = Math.log2(OVERVIEW_SCALE) - camera.log2Scale
+    const perturbed = mid.reference !== null && depth >= MIN_SKIP_DEPTH
+    const dive = perturbed && mid.reference ? this.diveProgram(mid.reference) : null
+    if (mid.reference && dive) {
+      const { constants } = dive
+      skip = planSkip(camera.log2Scale, constants)
+      const point = mid.reference
+      nBase = skip.j0 >= 1 ? point.preperiod + skip.j0 * point.period : 0
+      nRange = point.preperiod + mid.maxIter + point.period * (12 / constants.log2Lambda + 2)
+    } else if (mid.reference) {
+      maxIter = directIterations(depth)
+    }
     return {
-      camera: { center: mid.center, scale: mid.scale, rotation: mid.rotation },
+      camera,
       layout,
       sceneId: mid.sceneId,
       julia: mid.julia,
-      maxIter: mid.maxIter,
+      perturbed,
+      maxIter,
       seed: mid.seed,
+      reference: mid.reference,
+      skip,
+      nBase,
+      nRange,
       target,
       tile: 0,
     }
@@ -268,23 +327,52 @@ export class GlRenderer implements Renderer {
   private renderTile(key: Keyframe): void {
     const { gl } = this
     const programs = this.programs as Programs
-    const prog = key.julia ? programs.julia : programs.mandelbrot
-    const u = prog.uniforms
-    const { layout } = key
+    const { layout, camera } = key
     gl.bindFramebuffer(gl.FRAMEBUFFER, key.target.framebuffer)
     gl.viewport(0, 0, layout.width, layout.height)
     gl.enable(gl.SCISSOR_TEST)
     gl.scissor(0, key.tile * layout.rowsPerTile, layout.width, layout.rowsPerTile)
-    gl.useProgram(prog.program)
-    gl.uniform2f(u.u_center, key.camera.center[0], key.camera.center[1])
-    gl.uniform2f(u.u_rot, Math.cos(key.camera.rotation), Math.sin(key.camera.rotation))
-    gl.uniform1f(u.u_unitsPerTexel, layout.unitsPerTexel)
-    gl.uniform2f(u.u_texCenter, layout.width / 2, layout.height / 2)
-    gl.uniform1i(u.u_maxIter, key.maxIter)
-    gl.uniform2f(u.u_seed, key.seed[0], key.seed[1])
-    gl.uniform1f(u.u_tile, key.tile)
-    gl.uniform1f(u.u_rowsPerTile, layout.rowsPerTile)
-    gl.uniform1f(u.u_tiles, layout.tiles)
+    const setTile = (u: Uniforms<typeof TILE_UNIFORMS>): void => {
+      gl.uniform1f(u.u_tile, key.tile)
+      gl.uniform1f(u.u_rowsPerTile, layout.rowsPerTile)
+      gl.uniform1f(u.u_tiles, layout.tiles)
+      gl.uniform2f(u.u_texCenter, layout.width / 2, layout.height / 2)
+      gl.uniform2f(u.u_rot, Math.cos(camera.rotation), Math.sin(camera.rotation))
+    }
+    const dive = key.perturbed && key.reference ? this.diveProgram(key.reference) : null
+    if (key.perturbed && !dive) {
+      gl.clearColor(0, 0, 0, 1)
+      gl.clear(gl.COLOR_BUFFER_BIT)
+      gl.disable(gl.SCISSOR_TEST)
+      return
+    }
+    if (dive && key.skip) {
+      const { program } = dive
+      const u = program.uniforms
+      gl.useProgram(program.program)
+      setTile(u)
+      gl.uniform2f(u.u_offset, camera.offset[0], camera.offset[1])
+      gl.uniform1f(u.u_texelToView, layout.texelToView)
+      gl.uniform1i(u.u_k0, key.skip.k0)
+      gl.uniform1f(u.u_mant, key.skip.mant)
+      gl.uniform1f(u.u_j0, key.skip.j0)
+      gl.uniform1f(u.u_log2Mag0, key.skip.log2Mag0)
+      gl.uniform1f(u.u_phase0, key.skip.phase0)
+      gl.uniform1f(u.u_nBase, key.nBase)
+      gl.uniform1f(u.u_nRange, key.nRange)
+      gl.uniform1i(u.u_maxIter, key.maxIter)
+    } else {
+      const direct = key.julia ? programs.julia : programs.mandelbrot
+      const u = direct.uniforms
+      gl.useProgram(direct.program)
+      setTile(u)
+      const center = cameraCenter(camera)
+      gl.uniform2f(u.u_center, center[0], center[1])
+      gl.uniform1f(u.u_unitsPerTexel, layout.texelToView * Math.pow(2, camera.log2Scale))
+      gl.uniform1i(u.u_maxIter, key.maxIter)
+      gl.uniform2f(u.u_seed, key.seed[0], key.seed[1])
+      gl.uniform1f(u.u_nRange, key.nRange)
+    }
     gl.drawArrays(gl.TRIANGLES, 0, 3)
     gl.disable(gl.SCISSOR_TEST)
   }
@@ -319,6 +407,10 @@ export class GlRenderer implements Renderer {
     gl.uniform2f(u.u_offset, map.offset[0], map.offset[1])
     gl.uniform2f(u.u_resolutionInv, 1 / canvas.width, 1 / canvas.height)
     gl.uniform1i(u.u_julia, frame.julia ? 1 : 0)
+    gl.uniform1f(u.u_nRange, key.nRange)
+    gl.uniform1f(u.u_nBase, key.nBase)
+    // The palette is periodic in n, so only the base count modulo that period matters.
+    gl.uniform1f(u.u_nBaseWrapped, key.nBase % (frame.colorScale * lut.period))
     // The shift only ever enters the periodic table, so wrapping it keeps precision as it grows.
     gl.uniform1f(u.u_colorShift, frame.colorShift % lut.period)
     gl.uniform1f(u.u_colorScaleInv, 1 / frame.colorScale)
@@ -326,6 +418,24 @@ export class GlRenderer implements Renderer {
     gl.uniform1f(u.u_brightness, frame.brightness)
     gl.uniform1f(u.u_farField, frame.farField)
     gl.drawArrays(gl.TRIANGLES, 0, 3)
+  }
+
+  /** Dive programs are compiled on first use of a point (hidden by the fade-in) and kept for the session. */
+  private diveProgram(point: MisiurewiczPoint): DiveProgram | null {
+    const cached = this.divePrograms.get(point)
+    if (cached !== undefined) return cached
+    const programs = this.programs as Programs
+    let built: DiveProgram | null = null
+    try {
+      built = {
+        program: this.link(programs.vertex, diveShaderSource(point), DIVE_UNIFORMS),
+        constants: perturbationConstants(point),
+      }
+    } catch (error) {
+      console.error('Dive shader rejected for ' + point.c[0] + ', ' + point.c[1] + ': ' + String(error))
+    }
+    this.divePrograms.set(point, built)
+    return built
   }
 
   private createLut(): PaletteLut {
@@ -402,18 +512,19 @@ export class GlRenderer implements Renderer {
     const { gl } = this
     const vertex = this.compile(gl.VERTEX_SHADER, VERTEX_SHADER)
     const programs: Programs = {
-      mandelbrot: this.link(vertex, keyframeShaderSource(false), KEYFRAME_UNIFORMS),
-      julia: this.link(vertex, keyframeShaderSource(true), KEYFRAME_UNIFORMS),
+      vertex,
+      julia: this.link(vertex, directShaderSource(true), DIRECT_UNIFORMS),
+      mandelbrot: this.link(vertex, directShaderSource(false), DIRECT_UNIFORMS),
       present: this.link(vertex, presentShaderSource(), PRESENT_UNIFORMS),
     }
+    this.divePrograms.clear()
 
     const buffer = gl.createBuffer()
     gl.bindBuffer(gl.ARRAY_BUFFER, buffer)
     gl.bufferData(gl.ARRAY_BUFFER, FULLSCREEN_TRIANGLE, gl.STATIC_DRAW)
-    // All programs declare the same single attribute, so it is bound once for all of them.
-    const position = gl.getAttribLocation(programs.present.program, 'a_position')
-    gl.enableVertexAttribArray(position)
-    gl.vertexAttribPointer(position, 2, gl.FLOAT, false, 0, 0)
+    // All programs bind the same single attribute to location 0, so it is set up once.
+    gl.enableVertexAttribArray(0)
+    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0)
     return programs
   }
 
@@ -451,4 +562,19 @@ export class GlRenderer implements Renderer {
     }
     return shader
   }
+}
+
+/**
+ * Splits the keyframe scale into mantissa and power-of-two exponent and picks the number
+ * of reference cycles a pixel one view unit from the anchor can skip before its offset
+ * reaches 2^-HANDOFF_BITS. The shader adjusts per pixel from there using only the
+ * pixel's log2 distance, so no absolute magnitude ever leaves single precision.
+ */
+export function planSkip(log2Scale: number, constants: PerturbationConstants): Skip {
+  const k0 = -Math.floor(log2Scale)
+  const mant = Math.pow(2, log2Scale + k0)
+  const base = constants.log2P + Math.log2(mant) - k0
+  const j0 = Math.floor((-HANDOFF_BITS - base) / constants.log2Lambda)
+  const phase = (j0 * constants.argLambda + constants.argP) % TWO_PI
+  return { k0, mant, j0, log2Mag0: j0 * constants.log2Lambda + base, phase0: phase < 0 ? phase + TWO_PI : phase }
 }

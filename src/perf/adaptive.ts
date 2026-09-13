@@ -18,9 +18,9 @@ export interface BudgetOptions {
 
 /**
  * The LG CX refreshes at 60 Hz, so present at 60 fps and spend what is left of each frame
- * on a slice of the next keyframe. Keyframes at full 1080p spread over up to 8 frames
- * still refresh the fractal 7.5 times a second, which slow ambient motion hides
- * completely behind the reprojection.
+ * on a slice of the next keyframe. Keyframes spread over up to 12 frames still refresh
+ * the fractal 5 times a second, which slow ambient motion hides completely behind the
+ * reprojection.
  */
 export const TV_BUDGET_OPTIONS: BudgetOptions = {
   initialScale: 0.5,
@@ -28,7 +28,7 @@ export const TV_BUDGET_OPTIONS: BudgetOptions = {
   maxScale: 1,
   initialTiles: 4,
   minTiles: 1,
-  maxTiles: 8,
+  maxTiles: 12,
   targetMs: 1000 / 60,
   window: 60,
   hitchMs: 250,

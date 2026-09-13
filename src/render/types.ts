@@ -1,14 +1,15 @@
+import type { MisiurewiczPoint } from '../scene/misiurewicz'
 import type { Vec2 } from '../scene/math'
 import type { PaletteBlend } from '../scene/palette'
+import type { Camera } from './keyframe'
 
-export interface FrameParams {
-  readonly center: Vec2
-  readonly scale: number
-  readonly rotation: number
+export interface FrameParams extends Camera {
   readonly maxIter: number
   readonly julia: boolean
   readonly seed: Vec2
-  /** Identifies the scene so a keyframe from a previous scene is never shown through a new camera. */
+  /** Reference orbit for a perturbation dive; null for Julia sets. */
+  readonly reference: MisiurewiczPoint | null
+  /** Identifies the scene run so a keyframe from before a cut is never shown after it. */
   readonly sceneId: number
   readonly palette: PaletteBlend
   /** Phase offset applied to the palette so colours drift over time. */

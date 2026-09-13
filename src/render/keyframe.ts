@@ -1,8 +1,15 @@
 import type { Vec2 } from '../scene/math'
 
+/**
+ * A camera is a similarity transform of the plane. Scale is kept as log2 so a zoom can
+ * run for hours without underflowing, and the screen centre is expressed as an offset
+ * from an anchor point in view units (half the viewport height = 1) so deep zooms never
+ * subtract two nearly equal absolute coordinates.
+ */
 export interface Camera {
-  readonly center: Vec2
-  readonly scale: number
+  readonly anchor: Vec2
+  readonly offset: Vec2
+  readonly log2Scale: number
   readonly rotation: number
 }
 
@@ -16,8 +23,8 @@ export interface KeyframeLayout {
   readonly height: number
   readonly tiles: number
   readonly rowsPerTile: number
-  /** Complex-plane distance between adjacent texel centres. */
-  readonly unitsPerTexel: number
+  /** View units (of the keyframe camera) between adjacent texel centres. */
+  readonly texelToView: number
 }
 
 export interface Reprojection {
@@ -28,25 +35,25 @@ export interface Reprojection {
 
 /**
  * Plans a keyframe whose texel density is `resolutionScale` times the screen's at the
- * keyframe camera, and which covers a view of half-height `coverScale` (at least the
- * camera's scale, so zoom-outs and rotation have pixels to sample from).
+ * keyframe camera, and which covers `coverLog2Scale` (at least the camera's scale, so
+ * zoom-outs and rotation have pixels to sample from).
  */
 export function planKeyframe(
   screenWidth: number,
   screenHeight: number,
   resolutionScale: number,
-  cameraScale: number,
-  coverScale: number,
+  cameraLog2Scale: number,
+  coverLog2Scale: number,
   tiles: number,
   maxWidth: number,
   maxHeight: number,
 ): KeyframeLayout {
-  const unitsPerTexel = (2 * cameraScale) / (resolutionScale * screenHeight)
-  const cover = Math.max(1, coverScale / cameraScale)
+  const texelToView = 2 / (resolutionScale * screenHeight)
+  const cover = Math.max(1, Math.pow(2, coverLog2Scale - cameraLog2Scale))
   const width = Math.max(1, Math.min(maxWidth, Math.ceil(resolutionScale * screenWidth * cover)))
   const rows = Math.ceil(resolutionScale * screenHeight * cover)
   const rowsPerTile = Math.max(1, Math.min(Math.floor(maxHeight / tiles), Math.ceil(rows / tiles)))
-  return { width, height: rowsPerTile * tiles, tiles, rowsPerTile, unitsPerTexel }
+  return { width, height: rowsPerTile * tiles, tiles, rowsPerTile, texelToView }
 }
 
 export function storedRow(row: number, layout: KeyframeLayout): number {
@@ -60,10 +67,10 @@ export function fractalRow(stored: number, layout: KeyframeLayout): number {
 
 /**
  * Maps a screen pixel (gl_FragCoord, origin bottom-left) through the current camera into
- * the complex plane and back through the keyframe camera into keyframe texel coordinates.
- * Both cameras are similarity transforms, so the composition is affine and can be
- * evaluated exactly in the shader without touching complex-plane magnitudes, where
- * single precision would smear deep zooms.
+ * the plane and back through the keyframe camera into keyframe texel coordinates. Both
+ * cameras are similarities, so the composition is affine. Everything is computed in view
+ * units and log2 ratios, so it stays exact at any depth as long as both cameras share
+ * an anchor; keyframes from a different anchor are never presented.
  */
 export function reproject(
   screenWidth: number,
@@ -72,17 +79,23 @@ export function reproject(
   key: Camera,
   layout: KeyframeLayout,
 ): Reprojection {
-  const unitsPerPixel = (2 * current.scale) / screenHeight
-  const s = unitsPerPixel / layout.unitsPerTexel
+  const ratio = Math.pow(2, current.log2Scale - key.log2Scale)
+  const s = ((2 / screenHeight) * ratio) / layout.texelToView
   const theta = current.rotation - key.rotation
   const cs = Math.cos(theta) * s
   const sn = Math.sin(theta) * s
-  const dx = current.center[0] - key.center[0]
-  const dy = current.center[1] - key.center[1]
   const ck = Math.cos(key.rotation)
   const sk = Math.sin(key.rotation)
-  const tx = (ck * dx + sk * dy) / layout.unitsPerTexel
-  const ty = (-sk * dx + ck * dy) / layout.unitsPerTexel
+  // Screen-centre offset from the anchor, in keyframe view units, then into texels.
+  let dx = current.offset[0] * ratio - key.offset[0]
+  let dy = current.offset[1] * ratio - key.offset[1]
+  if (current.anchor[0] !== key.anchor[0] || current.anchor[1] !== key.anchor[1]) {
+    const keyScale = Math.pow(2, key.log2Scale)
+    dx += (current.anchor[0] - key.anchor[0]) / keyScale
+    dy += (current.anchor[1] - key.anchor[1]) / keyScale
+  }
+  const tx = (ck * dx + sk * dy) / layout.texelToView
+  const ty = (-sk * dx + ck * dy) / layout.texelToView
   const halfW = screenWidth / 2
   const halfH = screenHeight / 2
   return {
@@ -98,4 +111,10 @@ export function reproject(
 export function applyReprojection(r: Reprojection, x: number, y: number): Vec2 {
   const [a, b, c, d] = r.matrix
   return [a * x + c * y + r.offset[0], b * x + d * y + r.offset[1]]
+}
+
+/** Absolute plane coordinates of a camera's screen centre; loses precision at depth and is for the CPU fallback and tests only. */
+export function cameraCenter(camera: Camera): Vec2 {
+  const scale = Math.pow(2, camera.log2Scale)
+  return [camera.anchor[0] + camera.offset[0] * scale, camera.anchor[1] + camera.offset[1] * scale]
 }
