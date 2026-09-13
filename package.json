@@ -1,0 +1,28 @@
+{
+  "name": "tv-fractals",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Ambient Mandelbrot screensaver for LG webOS TV",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "icons": "node scripts/make-icons.mjs",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "tv:setup": "ares-setup-device --add tv -i \"host=${TV_IP:-192.168.1.100}\" -i \"port=9922\" -i \"username=prisoner\"",
+    "tv:key": "ares-novacom --device tv --getkey",
+    "hosted": "npm run build && ares-launch --device tv --hosted dist",
+    "package": "ares-package dist -o build",
+    "install:tv": "ares-install --device tv build/com.shuyangli.fractals_0.1.0_all.ipk",
+    "launch": "ares-launch --device tv com.shuyangli.fractals",
+    "deploy": "npm run build && npm run package && npm run install:tv && npm run launch",
+    "inspect": "ares-inspect --device tv --app com.shuyangli.fractals --open"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.3",
+    "vite": "^5.4.10",
+    "vitest": "^2.1.4"
+  }
+}

@@ -1,0 +1,5 @@
+node_modules/
+dist/
+build/
+*.ipk
+.DS_Store

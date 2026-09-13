@@ -1,0 +1,15 @@
+{
+  "id": "com.shuyangli.fractals",
+  "version": "0.1.0",
+  "vendor": "Shuyang Li",
+  "type": "web",
+  "main": "index.html",
+  "title": "Fractals",
+  "icon": "icon.png",
+  "largeIcon": "largeIcon.png",
+  "bgColor": "#05060a",
+  "iconColor": "#1b2a4a",
+  "disableBackHistoryAPI": true,
+  "supportPortraitMode": false,
+  "requiredACG": []
+}
