@@ -1,46 +1,37 @@
 import { describe, expect, it } from 'vitest'
-import { OVERVIEW_CENTER, OVERVIEW_SCALE } from '../src/scene/quality'
 import { cameraCenter } from '../src/render/keyframe'
-import { resolveMisiurewicz, SCENES, cardioidSeed, type DiveScene, type JuliaScene } from '../src/scene/scenes'
-import { diveDepth, sceneDuration, Tour, ZOOM_DOUBLINGS_PER_SECOND } from '../src/scene/tour'
+import { MANDELBROT } from '../src/scene/formula'
+import { resolveMisiurewicz, SCENES, type DiveScene } from '../src/scene/scenes'
+import { diveDepth, Tour, ZOOM_DOUBLINGS_PER_SECOND } from '../src/scene/tour'
 
 const dive: DiveScene = {
   kind: 'dive',
   name: 'test dive',
-  point: resolveMisiurewicz([-0.1, 0.95], 4, 1),
+  point: resolveMisiurewicz(MANDELBROT, [-0.1, 0.95], 4, 1),
   spin: 0,
 }
 
-const julia: JuliaScene = {
-  kind: 'julia',
-  name: 'test julia',
-  durationSeconds: 8,
-  seedPath: (u) => [u, 1 - u],
-  scale: 1.5,
-  spin: 0.1,
-  iterations: 250,
-}
+const other: DiveScene = { ...dive, name: 'other', spin: 0.1 }
 
 describe('Tour dive', () => {
   it('starts framed like the overview', () => {
     const tour = new Tour([dive])
     const start = tour.frame()
-    expect(start.log2Scale).toBeCloseTo(Math.log2(OVERVIEW_SCALE))
+    expect(start.log2Scale).toBeCloseTo(Math.log2(MANDELBROT.overviewScale))
+    expect(start.depth).toBe(0)
     const centre = cameraCenter(start)
-    expect(centre[0]).toBeCloseTo(OVERVIEW_CENTER[0])
-    expect(centre[1]).toBeCloseTo(OVERVIEW_CENTER[1])
+    expect(centre[0]).toBeCloseTo(MANDELBROT.overviewCenter[0])
+    expect(centre[1]).toBeCloseTo(MANDELBROT.overviewCenter[1])
     expect(start.anchor).toEqual(dive.point.c)
     expect(start.reference).toBe(dive.point)
-    expect(start.phase).toBe('in')
   })
 
   it('zooms at a constant rate in log space forever', () => {
     const tour = new Tour([dive])
     tour.seek(100)
-    expect(tour.frame().log2Scale).toBeCloseTo(Math.log2(OVERVIEW_SCALE) - 100 * ZOOM_DOUBLINGS_PER_SECOND)
+    expect(tour.frame().log2Scale).toBeCloseTo(Math.log2(MANDELBROT.overviewScale) - 100 * ZOOM_DOUBLINGS_PER_SECOND)
     tour.seek(1e5)
-    expect(tour.frame().log2Scale).toBeCloseTo(Math.log2(OVERVIEW_SCALE) - diveDepth(1e5))
-    expect(sceneDuration(dive)).toBe(Infinity)
+    expect(tour.frame().depth).toBeCloseTo(diveDepth(1e5))
   })
 
   it('slides the point to the screen centre over the first doublings and keeps it there', () => {
@@ -59,83 +50,50 @@ describe('Tour dive', () => {
     expect(tour.frame().brightness).toBe(1)
   })
 
-  it('never restarts on its own', () => {
-    const tour = new Tour([dive, julia])
+  it('never restarts or advances on its own', () => {
+    const tour = new Tour([dive, other])
+    const epoch = tour.epoch
     expect(tour.update(1e6)).toBe(false)
     expect(tour.sceneIndex).toBe(0)
+    expect(tour.epoch).toBe(epoch)
   })
 })
 
 describe('Tour sequencing', () => {
-  it('restarts a looping scene when it ends instead of advancing', () => {
-    const tour = new Tour([julia, dive])
-    const epoch = tour.epoch
-    expect(tour.update(sceneDuration(julia) - 1)).toBe(false)
-    expect(tour.update(1.5)).toBe(true)
-    expect(tour.sceneIndex).toBe(0)
-    expect(tour.elapsed).toBeCloseTo(0.5)
-    expect(tour.epoch).toBe(epoch + 1)
-  })
-
   it('changes epoch on manual scene switches so stale keyframes are dropped', () => {
-    const tour = new Tour([dive, julia])
+    const tour = new Tour([dive, other])
     const epoch = tour.epoch
     tour.next()
     expect(tour.epoch).toBe(epoch + 1)
     expect(tour.frame().epoch).toBe(epoch + 1)
-    expect(tour.frame().julia).toBe(true)
-  })
-
-  it('walks the Julia seed along its path', () => {
-    const tour = new Tour([julia])
-    expect(tour.frame().seed).toEqual([0, 1])
-    tour.seek(4)
-    expect(tour.frame().seed[0]).toBeCloseTo(0.5)
-    tour.seek(8)
-    expect(tour.frame().seed).toEqual([1, 0])
+    expect(tour.frame().sceneName).toBe('other')
+    expect(tour.elapsed).toBe(0)
   })
 
   it('supports manual next and prev with wraparound', () => {
-    const tour = new Tour([dive, julia])
+    const tour = new Tour([dive, other])
     tour.prev()
     expect(tour.sceneIndex).toBe(1)
     tour.next()
     expect(tour.sceneIndex).toBe(0)
-    expect(tour.elapsed).toBe(0)
-  })
-
-  it('uses the Julia scene iteration budget', () => {
-    const tour = new Tour([julia])
-    expect(tour.frame().maxIter).toBe(250)
-    expect(tour.frame().reference).toBeNull()
   })
 
   it('accumulates rotation from the scene spin', () => {
-    const tour = new Tour([julia])
+    const tour = new Tour([other])
     tour.update(2)
     expect(tour.frame().rotation).toBeCloseTo(0.2)
   })
 })
 
 describe('scene library', () => {
-  it('alternates endless dives with Julia sets, every dive on a resolved Misiurewicz point', () => {
-    for (let i = 0; i < SCENES.length; i++) {
-      const scene = SCENES[i]
-      expect(scene.kind).toBe(i % 2 === 0 ? 'dive' : 'julia')
-      if (scene.kind === 'dive') {
-        expect(scene.point.preperiod).toBeGreaterThan(0)
-        expect(Math.hypot(...scene.point.multiplier)).toBeGreaterThan(1)
-      } else {
-        expect(sceneDuration(scene)).toBeGreaterThan(0)
-      }
+  it('is all endless dives on resolved repelling Misiurewicz points, with more than one formula', () => {
+    const formulas = new Set<string>()
+    for (const scene of SCENES) {
+      expect(scene.kind).toBe('dive')
+      expect(scene.point.preperiod).toBeGreaterThan(0)
+      expect(scene.point.growth).toBeGreaterThan(1)
+      formulas.add(scene.point.formula.id)
     }
-  })
-
-  it('places cardioid seeds on the main cardioid boundary when r = 1', () => {
-    // θ = 0 maps to the cusp at c = 1/4; θ = π maps to c = −3/4 where the period-2 bulb attaches.
-    expect(cardioidSeed(0, 1)[0]).toBeCloseTo(0.25)
-    expect(cardioidSeed(0, 1)[1]).toBeCloseTo(0)
-    expect(cardioidSeed(Math.PI, 1)[0]).toBeCloseTo(-0.75)
-    expect(cardioidSeed(Math.PI, 1)[1]).toBeCloseTo(0)
+    expect(formulas.size).toBeGreaterThan(1)
   })
 })

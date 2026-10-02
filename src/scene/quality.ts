@@ -12,6 +12,11 @@ export const MAX_ITERATIONS = 1024
 export const OVERVIEW_SCALE = 1.35
 export const OVERVIEW_CENTER: readonly [number, number] = [-0.6, 0]
 
+/** Zoom depth in doublings below the formula's overview. */
+export function depthOf(point: MisiurewiczPoint, log2Scale: number): number {
+  return Math.log2(point.formula.overviewScale) - log2Scale
+}
+
 /**
  * Pixels leave the closed-form regime once their orbit offset reaches 2^-HANDOFF_BITS of
  * the reference orbit's scale. The handoff uses a KOENIGS_ORDER-term series, so the
@@ -20,6 +25,15 @@ export const OVERVIEW_CENTER: readonly [number, number] = [-0.6, 0]
  */
 export const HANDOFF_BITS = 6
 export const KOENIGS_ORDER = 5
+/**
+ * Non-holomorphic formulas have no series, so their linear-only handoff must happen much
+ * earlier; their cycles are strongly repelling, so the extra iterations are few.
+ */
+export const LINEAR_HANDOFF_BITS = 16
+
+export function handoffBits(point: MisiurewiczPoint): number {
+  return point.formula.holomorphic ? HANDOFF_BITS : LINEAR_HANDOFF_BITS
+}
 /**
  * Above this depth (in doublings) the pixel offset δc is so small that its own terms in
  * the orbit dynamics vanish and the series applies; shallower views iterate from scratch,
@@ -42,7 +56,6 @@ export function directIterations(depth: number): number {
  * about HANDOFF_BITS * period / log2|λ| iterations, so weakly repelling cycles cost more.
  */
 export function diveIterations(point: MisiurewiczPoint): number {
-  const log2Lambda = Math.log2(Math.hypot(point.multiplier[0], point.multiplier[1]))
-  const growth = (HANDOFF_BITS * point.period) / log2Lambda
+  const growth = (handoffBits(point) * point.period) / Math.log2(point.growth)
   return Math.round(clamp(growth + TAIL_ITERATIONS, 64, MAX_ITERATIONS))
 }

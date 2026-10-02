@@ -14,17 +14,18 @@ export interface Camera {
 }
 
 /**
- * Texel grid of one keyframe. Rows are stored interleaved: fractal row y lives at
- * stored row (y mod tiles) * rowsPerTile + floor(y / tiles), so each tile (a contiguous
- * band of stored rows) samples the whole image and every tile costs about the same.
+ * Texel grid of one keyframe. Rows are stored permuted: fractal row y lives at stored row
+ * (y * rowStrideInv) mod height, so any run of consecutive stored rows is spread almost
+ * evenly over the whole image and every slice of the render costs about the same.
  */
 export interface KeyframeLayout {
   readonly width: number
   readonly height: number
-  readonly tiles: number
-  readonly rowsPerTile: number
   /** View units (of the keyframe camera) between adjacent texel centres. */
   readonly texelToView: number
+  /** Stored row s holds fractal row (s * rowStride) mod height. */
+  readonly rowStride: number
+  readonly rowStrideInv: number
 }
 
 export interface Reprojection {
@@ -33,36 +34,71 @@ export interface Reprojection {
   readonly offset: Vec2
 }
 
+const GOLDEN = (Math.sqrt(5) - 1) / 2
+
+function gcd(a: number, b: number): number {
+  while (b !== 0) {
+    const t = a % b
+    a = b
+    b = t
+  }
+  return a
+}
+
+function modularInverse(a: number, m: number): number {
+  let [oldR, r] = [a, m]
+  let [oldS, s] = [1, 0]
+  while (r !== 0) {
+    const q = Math.floor(oldR / r)
+    ;[oldR, r] = [r, oldR - q * r]
+    ;[oldS, s] = [s, oldS - q * s]
+  }
+  return ((oldS % m) + m) % m
+}
+
 /**
- * Plans a keyframe whose texel density is `resolutionScale` times the screen's at the
- * keyframe camera, and which covers `coverLog2Scale` (at least the camera's scale, so
- * zoom-outs and rotation have pixels to sample from).
+ * Multiplier near height / golden ratio that is coprime with the height, so stored rows
+ * taken in order visit fractal rows as a low-discrepancy sequence, and its inverse.
+ */
+export function rowPermutation(height: number): { stride: number; inverse: number } {
+  if (height <= 2) return { stride: 1, inverse: 1 }
+  const target = Math.round(height * GOLDEN)
+  for (let delta = 0; delta < height; delta++) {
+    for (const stride of [target - delta, target + delta]) {
+      if (stride > 1 && stride < height && gcd(stride, height) === 1) {
+        return { stride, inverse: modularInverse(stride, height) }
+      }
+    }
+  }
+  return { stride: 1, inverse: 1 }
+}
+
+/**
+ * Plans a keyframe whose texel density is `density` times the screen's at the keyframe
+ * camera and whose extent is `cover` times the screen, so the zoom can show it minified
+ * a little while it fades in and rotation or drift have pixels to sample.
  */
 export function planKeyframe(
   screenWidth: number,
   screenHeight: number,
-  resolutionScale: number,
-  cameraLog2Scale: number,
-  coverLog2Scale: number,
-  tiles: number,
+  density: number,
+  cover: number,
   maxWidth: number,
   maxHeight: number,
 ): KeyframeLayout {
-  const texelToView = 2 / (resolutionScale * screenHeight)
-  const cover = Math.max(1, Math.pow(2, coverLog2Scale - cameraLog2Scale))
-  const width = Math.max(1, Math.min(maxWidth, Math.ceil(resolutionScale * screenWidth * cover)))
-  const rows = Math.ceil(resolutionScale * screenHeight * cover)
-  const rowsPerTile = Math.max(1, Math.min(Math.floor(maxHeight / tiles), Math.ceil(rows / tiles)))
-  return { width, height: rowsPerTile * tiles, tiles, rowsPerTile, texelToView }
+  const texelToView = 2 / (density * screenHeight)
+  const width = Math.max(1, Math.min(maxWidth, Math.ceil(density * screenWidth * cover)))
+  const height = Math.max(1, Math.min(maxHeight, Math.ceil(density * screenHeight * cover)))
+  const { stride, inverse } = rowPermutation(height)
+  return { width, height, texelToView, rowStride: stride, rowStrideInv: inverse }
 }
 
 export function storedRow(row: number, layout: KeyframeLayout): number {
-  return (row % layout.tiles) * layout.rowsPerTile + Math.floor(row / layout.tiles)
+  return (row * layout.rowStrideInv) % layout.height
 }
 
 export function fractalRow(stored: number, layout: KeyframeLayout): number {
-  const tile = Math.floor(stored / layout.rowsPerTile)
-  return (stored - tile * layout.rowsPerTile) * layout.tiles + tile
+  return (stored * layout.rowStride) % layout.height
 }
 
 /**

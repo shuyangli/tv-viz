@@ -1,14 +1,11 @@
 import type { MisiurewiczPoint } from '../scene/misiurewicz'
-import type { Vec2 } from '../scene/math'
 import type { PaletteBlend } from '../scene/palette'
 import type { Camera } from './keyframe'
 
 export interface FrameParams extends Camera {
   readonly maxIter: number
-  readonly julia: boolean
-  readonly seed: Vec2
-  /** Reference orbit for a perturbation dive; null for Julia sets. */
-  readonly reference: MisiurewiczPoint | null
+  /** The dive's anchor point, whose orbit is the perturbation reference. */
+  readonly reference: MisiurewiczPoint
   /** Identifies the scene run so a keyframe from before a cut is never shown after it. */
   readonly sceneId: number
   readonly palette: PaletteBlend
@@ -21,22 +18,34 @@ export interface FrameParams extends Camera {
   readonly farField: number
 }
 
-/** Where the camera will be `aheadSeconds` from now, so a keyframe can be rendered for the moment it will be shown. */
-export type Predict = (aheadSeconds: number) => FrameParams
+/** The camera at the moment the zoom reaches `log2Scale`, so a keyframe can be rendered for where it will be shown. */
+export type Predict = (log2Scale: number) => FrameParams
 
-export interface RenderQuality {
-  /** Keyframe texel density relative to the screen. */
-  readonly scale: number
-  /** Frames over which one keyframe is spread. */
-  readonly tiles: number
+export interface RenderBudget {
+  /** Escape-time samples (texels times subsamples) the GPU may run per displayed frame. */
+  readonly samplesPerFrame: number
+  /** Doublings the zoom advances per displayed frame at the current speed; 0 while paused. */
+  readonly doublingsPerFrame: number
+  /** Pins keyframe density (relative to the screen) for measurement; null adapts. */
+  readonly density: number | null
+  /** Pins samples per texel for measurement; null adapts. */
+  readonly samples: number | null
+}
+
+export interface RenderStats {
+  readonly width: number
+  readonly height: number
+  readonly density: number
+  readonly samples: number
+  readonly rowsPerFrame: number
+  /** Schedule index of the keyframe on screen and how far the newest one has faded in (1 = fully). */
+  readonly index: number
+  readonly blend: number
 }
 
 export interface Renderer {
   readonly kind: 'webgl' | 'cpu'
   setSize(width: number, height: number): void
-  setQuality(quality: RenderQuality): void
-  render(frame: FrameParams, predict: Predict, frameSeconds: number): void
-  /** Waits for the GPU after each frame and reports the time it took, for benchmarking; costs throughput. */
-  setBenchmark(enabled: boolean): void
-  readonly gpuMs: number | null
+  render(frame: FrameParams, predict: Predict, budget: RenderBudget): void
+  readonly stats: RenderStats | null
 }

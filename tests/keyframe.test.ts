@@ -5,6 +5,7 @@ import {
   fractalRow,
   planKeyframe,
   reproject,
+  rowPermutation,
   storedRow,
   type Camera,
   type KeyframeLayout,
@@ -16,50 +17,60 @@ const W = 1920
 const H = 1080
 
 describe('planKeyframe', () => {
-  it('matches screen texel density at scale 1 and pads the height to a tile multiple', () => {
-    const layout = planKeyframe(W, H, 1, -6, -6, 7, 4096, 4096)
+  it('matches screen texel density at density 1', () => {
+    const layout = planKeyframe(W, H, 1, 1, 4096, 4096)
     expect(layout.width).toBe(W)
-    expect(layout.height % 7).toBe(0)
-    expect(layout.height).toBeGreaterThanOrEqual(H)
-    expect(layout.rowsPerTile * 7).toBe(layout.height)
+    expect(layout.height).toBe(H)
     expect(layout.texelToView).toBeCloseTo(2 / H)
   })
 
   it('covers a larger view with more texels at the same density', () => {
-    const tight = planKeyframe(W, H, 0.5, 0, 0, 4, 4096, 4096)
-    const wide = planKeyframe(W, H, 0.5, 0, Math.log2(1.1), 4, 4096, 4096)
+    const tight = planKeyframe(W, H, 0.5, 1, 4096, 4096)
+    const wide = planKeyframe(W, H, 0.5, 1.1, 4096, 4096)
     expect(wide.texelToView).toBe(tight.texelToView)
     expect(wide.width).toBeGreaterThan(tight.width)
     expect(wide.height).toBeGreaterThan(tight.height)
   })
 
   it('never exceeds the allocated texture', () => {
-    const layout = planKeyframe(W, H, 1, 0, 1, 8, 2000, 1100)
+    const layout = planKeyframe(W, H, 1, 2, 2000, 1100)
     expect(layout.width).toBeLessThanOrEqual(2000)
     expect(layout.height).toBeLessThanOrEqual(1100)
   })
 })
 
-describe('row interleaving', () => {
-  it('is a bijection between fractal rows and stored rows', () => {
-    const layout: KeyframeLayout = { width: 1, height: 35, tiles: 5, rowsPerTile: 7, texelToView: 1 }
-    const seen = new Set<number>()
-    for (let row = 0; row < layout.height; row++) {
-      const stored = storedRow(row, layout)
-      expect(stored).toBeGreaterThanOrEqual(0)
-      expect(stored).toBeLessThan(layout.height)
-      expect(fractalRow(stored, layout)).toBe(row)
-      seen.add(stored)
+describe('row permutation', () => {
+  it('is a bijection between fractal rows and stored rows for any height', () => {
+    for (const height of [1, 2, 3, 7, 35, 64, 1080, 1221]) {
+      const layout = planKeyframe(1, height, 1, 1, 4096, 4096)
+      const seen = new Set<number>()
+      for (let row = 0; row < layout.height; row++) {
+        const stored = storedRow(row, layout)
+        expect(stored).toBeGreaterThanOrEqual(0)
+        expect(stored).toBeLessThan(layout.height)
+        expect(fractalRow(stored, layout)).toBe(row)
+        seen.add(stored)
+      }
+      expect(seen.size).toBe(layout.height)
     }
-    expect(seen.size).toBe(layout.height)
   })
 
-  it('gives every tile rows spread across the whole image', () => {
-    const layout: KeyframeLayout = { width: 1, height: 40, tiles: 4, rowsPerTile: 10, texelToView: 1 }
-    const tileRows = (tile: number) =>
-      Array.from({ length: layout.rowsPerTile }, (_, i) => fractalRow(tile * layout.rowsPerTile + i, layout))
-    expect(tileRows(0)).toEqual([0, 4, 8, 12, 16, 20, 24, 28, 32, 36])
-    expect(tileRows(3)).toEqual([3, 7, 11, 15, 19, 23, 27, 31, 35, 39])
+  it('spreads any run of consecutive stored rows across the whole image', () => {
+    const layout = planKeyframe(1, 1000, 1, 1, 4096, 4096)
+    const { stride, inverse } = rowPermutation(1000)
+    expect(layout.rowStride).toBe(stride)
+    expect(layout.rowStrideInv).toBe(inverse)
+    expect(stride).toBeGreaterThan(550)
+    expect(stride).toBeLessThan(700)
+    // Ten consecutive stored rows: no two fractal rows closer than 5% of the height.
+    const rows = Array.from({ length: 10 }, (_, s) => fractalRow(400 + s, layout)).sort((a, b) => a - b)
+    for (let i = 1; i < rows.length; i++) expect(rows[i] - rows[i - 1]).toBeGreaterThan(50)
+  })
+
+  it('keeps the shader arithmetic exact in single precision at the largest keyframe', () => {
+    const layout = planKeyframe(2400, 1400, 1, 1, 4096, 4096)
+    expect(layout.height * layout.rowStride).toBeLessThan(Math.pow(2, 24))
+    expect(layout.height * layout.rowStrideInv).toBeLessThan(Math.pow(2, 24))
   })
 })
 
@@ -89,7 +100,7 @@ describe('reproject', () => {
   }
 
   it('is the identity when the camera has not moved and the keyframe is at screen density', () => {
-    const layout = planKeyframe(W, H, 1, key.log2Scale, key.log2Scale, 1, 4096, 4096)
+    const layout = planKeyframe(W, H, 1, 1, 4096, 4096)
     const r = reproject(W, H, key, key, layout)
     const p = applyReprojection(r, 100.5, 700.5)
     expect(p[0]).toBeCloseTo(100.5 + (layout.width - W) / 2, 6)
@@ -98,7 +109,7 @@ describe('reproject', () => {
 
   it('sends a screen pixel to the keyframe texel that samples the same point', () => {
     const current: Camera = { anchor, offset: [0.04, -0.03], log2Scale: Math.log2(2.7e-4), rotation: 0.41 }
-    const layout = planKeyframe(W, H, 0.6, key.log2Scale, key.log2Scale + 0.07, 6, 4096, 4096)
+    const layout = planKeyframe(W, H, 0.6, 1.05, 4096, 4096)
     const r = reproject(W, H, current, key, layout)
     const texelUnits = layout.texelToView * Math.pow(2, key.log2Scale)
     for (const [x, y] of [
@@ -118,7 +129,7 @@ describe('reproject', () => {
   it('stays finite and exact at depths far beyond double precision', () => {
     const deep: Camera = { anchor, offset: [0, 0], log2Scale: -5000, rotation: 1 }
     const deeper: Camera = { anchor, offset: [0, 0], log2Scale: -5000.3, rotation: 1.001 }
-    const layout = planKeyframe(W, H, 1, deep.log2Scale, deep.log2Scale, 4, 4096, 4096)
+    const layout = planKeyframe(W, H, 1, 1, 4096, 4096)
     const r = reproject(W, H, deeper, deep, layout)
     const centre = applyReprojection(r, W / 2, H / 2)
     expect(centre[0]).toBeCloseTo(layout.width / 2, 6)
@@ -148,5 +159,17 @@ describe('Tour.frameAt', () => {
     expect(far.sceneIndex).toBe(now.sceneIndex)
     expect(Number.isFinite(far.log2Scale)).toBe(true)
     expect(far.brightness).toBe(1)
+  })
+
+  it('predicts the frame at a given scale consistently with time-based lookahead', () => {
+    const tour = new Tour(SCENES)
+    tour.seek(10)
+    const ahead = tour.frameAt(3)
+    const atScale = tour.frameAtLog2Scale(ahead.log2Scale)
+    expect(atScale.log2Scale).toBeCloseTo(ahead.log2Scale, 9)
+    expect(atScale.rotation).toBeCloseTo(ahead.rotation, 9)
+    expect(atScale.offset[0]).toBeCloseTo(ahead.offset[0], 9)
+    expect(atScale.offset[1]).toBeCloseTo(ahead.offset[1], 9)
+    expect(atScale.maxIter).toBe(ahead.maxIter)
   })
 })

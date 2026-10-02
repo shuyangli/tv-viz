@@ -1,41 +1,32 @@
 import { smoothstep, TWO_PI, type Vec2 } from './math'
 import type { MisiurewiczPoint } from './misiurewicz'
-import { diveIterations, OVERVIEW_CENTER, OVERVIEW_SCALE } from './quality'
-import { SCENES, type DiveScene, type JuliaScene, type Scene } from './scenes'
-
-export type Phase = 'in' | 'roam'
+import { diveIterations } from './quality'
+import { SCENES, type DiveScene, type Scene } from './scenes'
 
 export interface SceneFrame {
-  /** Point the view is expressed relative to: the dive's Misiurewicz point, or the Julia view centre. */
+  /** Point the view is expressed relative to: the dive's Misiurewicz point. */
   readonly anchor: Vec2
   /** Screen centre minus anchor, in view units (half the viewport height = 1). */
   readonly offset: Vec2
   readonly log2Scale: number
+  /** Doublings below the formula's overview. */
+  readonly depth: number
   readonly rotation: number
-  readonly julia: boolean
-  readonly seed: Vec2
-  readonly reference: MisiurewiczPoint | null
+  readonly reference: MisiurewiczPoint
   readonly maxIter: number
   readonly sceneName: string
   readonly sceneIndex: number
   /** Changes on every scene switch and every loop restart, so a keyframe from before the cut is never shown after it. */
   readonly epoch: number
-  readonly phase: Phase
-  /** 0 = black, 1 = full brightness. Dips at scene boundaries to hide the cut. */
+  /** 0 = black, 1 = full brightness. Fades in after a cut. */
   readonly brightness: number
 }
 
 const FADE_SECONDS = 2
-const JULIA_BREATHE_AMOUNT = 0.08
-const JULIA_DRIFT_AMOUNT = 0.12
 /** Zoom speed of every dive. Constant in log space, so it reads as a steady fall. */
 export const ZOOM_DOUBLINGS_PER_SECOND = 0.12
 /** The dive starts framed like the overview and slides its point to the screen centre over these first doublings. */
 const CENTERING_DOUBLINGS = 8
-
-export function sceneDuration(scene: Scene): number {
-  return scene.kind === 'dive' ? Infinity : scene.durationSeconds
-}
 
 /** Zoom depth of a dive in doublings below the overview. */
 export function diveDepth(seconds: number): number {
@@ -43,9 +34,8 @@ export function diveDepth(seconds: number): number {
 }
 
 /**
- * Drives the camera for the current scene: a dive falls forever toward its Misiurewicz
- * point at a constant rate; a Julia scene morphs its seed and loops. Scenes only change
- * on request.
+ * Drives the camera for the current scene: every scene is a dive that falls forever
+ * toward its Misiurewicz point at a constant rate. Scenes only change on request.
  */
 export class Tour {
   private index: number
@@ -83,35 +73,32 @@ export class Tour {
 
   /** Skips straight to a moment inside the current scene. Used for debugging views. */
   seek(seconds: number): void {
-    this.sceneTime = Math.max(0, Math.min(seconds, sceneDuration(this.scene)))
+    this.sceneTime = Math.max(0, seconds)
   }
 
-  /** Advances time. Returns true when a looping scene reached its end and restarted. */
+  /** Advances time. Dives never end, so this never restarts a scene; it returns false for callers that once relied on that. */
   update(dtSeconds: number): boolean {
     this.rotation = (this.rotation + this.scene.spin * dtSeconds) % TWO_PI
     this.sceneTime += dtSeconds
-    const duration = sceneDuration(this.scene)
-    if (this.sceneTime < duration) return false
-    this.sceneTime = this.sceneTime % duration
-    this._epoch += 1
-    return true
+    return false
   }
 
   frame(): SceneFrame {
     return this.frameAt(0)
   }
 
-  /**
-   * The frame `aheadSeconds` from now, without advancing. Clamped to the current run of
-   * the scene: a keyframe predicted across a restart would be reprojected through the
-   * wrong camera, and the fade to black there means a slightly stale one is invisible.
-   */
+  /** The frame at which the dive reaches `log2Scale`, without advancing. Rotation is tied to depth, so this holds at any speed. */
+  frameAtLog2Scale(log2Scale: number): SceneFrame {
+    const depth = Math.log2(this.scene.point.formula.overviewScale) - log2Scale
+    return this.frameAt(depth / ZOOM_DOUBLINGS_PER_SECOND - this.sceneTime)
+  }
+
+  /** The frame `aheadSeconds` from now, without advancing. */
   frameAt(aheadSeconds: number): SceneFrame {
     const scene = this.scene
-    const duration = sceneDuration(scene)
-    const t = Math.max(0, Math.min(this.sceneTime + aheadSeconds, duration))
-    const brightness = Math.max(0, Math.min(1, t / FADE_SECONDS, (duration - t) / FADE_SECONDS))
-    const base = scene.kind === 'dive' ? this.diveFrame(scene, t) : this.juliaFrame(scene, t)
+    const t = Math.max(0, this.sceneTime + aheadSeconds)
+    const brightness = Math.max(0, Math.min(1, t / FADE_SECONDS))
+    const base = this.diveFrame(scene, t)
     return {
       ...base,
       rotation: (this.rotation + scene.spin * aheadSeconds) % TWO_PI,
@@ -129,47 +116,23 @@ export class Tour {
     this._epoch += 1
   }
 
-  private diveFrame(
-    scene: DiveScene,
-    t: number,
-  ): Pick<SceneFrame, 'anchor' | 'offset' | 'log2Scale' | 'julia' | 'seed' | 'reference' | 'maxIter' | 'phase'> {
+  private diveFrame(scene: DiveScene, t: number): Pick<SceneFrame, 'anchor' | 'offset' | 'log2Scale' | 'depth' | 'reference' | 'maxIter'> {
     const depth = diveDepth(t)
     const c = scene.point.c
+    const { overviewCenter, overviewScale } = scene.point.formula
     // Start framed exactly like the overview, then ease the point toward the screen centre.
     const framing = 1 - smoothstep(depth / CENTERING_DOUBLINGS)
     const offset: Vec2 = [
-      ((OVERVIEW_CENTER[0] - c[0]) / OVERVIEW_SCALE) * framing,
-      ((OVERVIEW_CENTER[1] - c[1]) / OVERVIEW_SCALE) * framing,
+      ((overviewCenter[0] - c[0]) / overviewScale) * framing,
+      ((overviewCenter[1] - c[1]) / overviewScale) * framing,
     ]
     return {
       anchor: c,
       offset,
-      log2Scale: Math.log2(OVERVIEW_SCALE) - depth,
-      julia: false,
-      seed: [0, 0],
+      log2Scale: Math.log2(overviewScale) - depth,
+      depth,
       reference: scene.point,
       maxIter: diveIterations(scene.point),
-      phase: 'in',
-    }
-  }
-
-  private juliaFrame(
-    scene: JuliaScene,
-    t: number,
-  ): Pick<SceneFrame, 'anchor' | 'offset' | 'log2Scale' | 'julia' | 'seed' | 'reference' | 'maxIter' | 'phase'> {
-    const u = Math.min(1, t / scene.durationSeconds)
-    const wobble = TWO_PI * t
-    const scale = scene.scale * (1 + JULIA_BREATHE_AMOUNT * Math.sin(wobble / 31))
-    const anchor: Vec2 = [JULIA_DRIFT_AMOUNT * Math.sin(wobble / 47), JULIA_DRIFT_AMOUNT * Math.cos(wobble / 59)]
-    return {
-      anchor,
-      offset: [0, 0],
-      log2Scale: Math.log2(scale),
-      julia: true,
-      seed: scene.seedPath(u),
-      reference: null,
-      maxIter: scene.iterations,
-      phase: 'roam',
     }
   }
 }

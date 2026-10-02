@@ -1,12 +1,10 @@
 export interface BudgetOptions {
-  readonly initialScale: number
-  readonly minScale: number
-  readonly maxScale: number
-  readonly initialTiles: number
-  readonly minTiles: number
-  readonly maxTiles: number
-  /** Frame time the controller steers toward. */
-  readonly targetMs: number
+  /** Work per frame while the baseline is measured, and the starting point after it. */
+  readonly initial: number
+  readonly min: number
+  readonly max: number
+  /** Frames over which the baseline frame interval is measured. */
+  readonly baselineFrames: number
   /** Frames averaged before each decision. */
   readonly window: number
   /** Frames longer than this are treated as hitches (tab switch, GC) and ignored. */
@@ -17,47 +15,45 @@ export interface BudgetOptions {
 }
 
 /**
- * The LG CX refreshes at 60 Hz, so present at 60 fps and spend what is left of each frame
- * on a slice of the next keyframe. Keyframes spread over up to 12 frames still refresh
- * the fractal 5 times a second, which slow ambient motion hides completely behind the
- * reprojection.
+ * The knob is escape-time samples per frame; the renderer turns it into rows per frame
+ * and, over a keyframe's lifetime, into resolution and supersampling. The starting work
+ * is a third of what the CX managed per frame in earlier builds, so the baseline is
+ * measured under a load it is sure to carry.
  */
 export const TV_BUDGET_OPTIONS: BudgetOptions = {
-  initialScale: 0.5,
-  minScale: 0.25,
-  maxScale: 1,
-  initialTiles: 4,
-  minTiles: 1,
-  maxTiles: 12,
-  targetMs: 1000 / 60,
+  initial: 30000,
+  min: 4000,
+  max: 4000000,
+  baselineFrames: 90,
   window: 60,
   hitchMs: 250,
   probeDelayMs: 4000,
   maxProbeDelayMs: 5 * 60 * 1000,
 }
 
-/** With vsync, the window mean is target * (1 + late fraction): shrink past ~5% late frames, grow only when essentially none are. */
-const SLOW_RATIO = 1.05
+/**
+ * Relative to the baseline, whose late-frame pattern is already in it: shrink once the
+ * window mean is clearly above it, grow only when it is essentially back at it.
+ */
+const SLOW_RATIO = 1.04
 const FAST_RATIO = 1.015
-const SHRINK_FACTOR = 0.9
-const GROW_FACTOR = 1.06
-
-export interface Budget {
-  readonly scale: number
-  readonly tiles: number
-}
+const SHRINK_FACTOR = 0.75
+const GROW_FACTOR = 1.1
 
 /**
- * Steers keyframe resolution and the number of frames a keyframe is spread over so the
- * display holds its refresh rate. When slow, it first spreads keyframes over more frames
- * (costing only latency) and then lowers resolution. When every frame lands on time it
- * grows again, resolution first. vsync hides how much headroom a fast frame has, so
- * growth is a probe: a probe that pushes frames late is undone and the next one waits
- * exponentially longer, which keeps the resulting stutter rare.
+ * Steers the work per displayed frame so it does not slow the display down. The display
+ * is not assumed to run at 60 Hz: the TV presents at whatever rate the panel is in, and
+ * with a 60 Hz animation clock a 50 Hz panel already shows one late frame in five with
+ * no work at all. So the controller first measures the frame interval under a light,
+ * known load and then steers the mean interval back to that baseline. vsync hides how
+ * much headroom a fast frame has, so growth is a probe: a probe that pushes frames late
+ * is undone and the next one waits exponentially longer, which keeps the resulting
+ * stutter rare. Shrinking while already at the minimum means the baseline itself has
+ * moved (the panel changed mode), so it is measured again.
  */
-export class AdaptiveBudget implements Budget {
-  private _scale: number
-  private _tiles: number
+export class AdaptiveBudget {
+  private _samplesPerFrame: number
+  private _baselineMs: number | null = null
   private sum = 0
   private count = 0
   private grewLast = false
@@ -65,16 +61,16 @@ export class AdaptiveBudget implements Budget {
   private nextProbeAt = 0
 
   constructor(private readonly opts: BudgetOptions = TV_BUDGET_OPTIONS) {
-    this._scale = opts.initialScale
-    this._tiles = opts.initialTiles
+    this._samplesPerFrame = opts.initial
   }
 
-  get scale(): number {
-    return this._scale
+  get samplesPerFrame(): number {
+    return this._samplesPerFrame
   }
 
-  get tiles(): number {
-    return this._tiles
+  /** Mean frame interval measured under the initial load, or null while it is being measured. */
+  get baselineMs(): number | null {
+    return this._baselineMs
   }
 
   /** The load has changed (new scene), so earlier failed probes say nothing about the new ceiling. */
@@ -91,11 +87,18 @@ export class AdaptiveBudget implements Budget {
     if (frameMs > this.opts.hitchMs || frameMs <= 0) return false
     this.sum += frameMs
     this.count += 1
+    if (this._baselineMs === null) {
+      if (this.count < this.opts.baselineFrames) return false
+      this._baselineMs = this.sum / this.count
+      this.sum = 0
+      this.count = 0
+      return false
+    }
     if (this.count < this.opts.window) return false
     const average = this.sum / this.count
     this.sum = 0
     this.count = 0
-    if (average > this.opts.targetMs * SLOW_RATIO) {
+    if (average > this._baselineMs * SLOW_RATIO) {
       if (this.grewLast) {
         this.probeDelay =
           this.probeDelay === 0
@@ -104,37 +107,30 @@ export class AdaptiveBudget implements Budget {
       }
       this.grewLast = false
       this.nextProbeAt = nowMs + this.probeDelay
-      return this.shrink()
+      if (this._samplesPerFrame <= this.opts.min) {
+        this.rebaseline()
+        return false
+      }
+      return this.set(this._samplesPerFrame * SHRINK_FACTOR)
     }
-    if (average <= this.opts.targetMs * FAST_RATIO && nowMs >= this.nextProbeAt) {
-      const grew = this.grow()
+    if (average <= this._baselineMs * FAST_RATIO && nowMs >= this.nextProbeAt) {
+      const grew = this.set(this._samplesPerFrame * GROW_FACTOR)
       this.grewLast = grew
       return grew
     }
     return false
   }
 
-  private shrink(): boolean {
-    if (this._tiles < this.opts.maxTiles) {
-      this._tiles += 1
-      return true
-    }
-    if (this._scale > this.opts.minScale) {
-      this._scale = Math.max(this.opts.minScale, this._scale * SHRINK_FACTOR)
-      return true
-    }
-    return false
+  private rebaseline(): void {
+    this._baselineMs = null
+    this._samplesPerFrame = this.opts.initial
+    this.grewLast = false
   }
 
-  private grow(): boolean {
-    if (this._scale < this.opts.maxScale) {
-      this._scale = Math.min(this.opts.maxScale, this._scale * GROW_FACTOR)
-      return true
-    }
-    if (this._tiles > this.opts.minTiles) {
-      this._tiles -= 1
-      return true
-    }
-    return false
+  private set(value: number): boolean {
+    const clamped = Math.max(this.opts.min, Math.min(this.opts.max, value))
+    if (clamped === this._samplesPerFrame) return false
+    this._samplesPerFrame = clamped
+    return true
   }
 }
