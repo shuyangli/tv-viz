@@ -37,23 +37,23 @@ describe('AdaptiveBudget baseline', () => {
     expect(feed(c, 20, 3)).toBe(false)
     expect(feed(c, 20, 1)).toBe(false)
     expect(c.baselineMs).toBe(20)
-    expect(c.samplesPerFrame).toBe(1000)
+    expect(c.work).toBe(1000)
   })
 
   it('treats a 50 Hz panel as normal: frames at the baseline grow the work', () => {
     const c = settled(20)
     expect(feed(c, 20, 4)).toBe(true)
-    expect(c.samplesPerFrame).toBeGreaterThan(1000)
+    expect(c.work).toBeGreaterThan(1000)
   })
 
   it('measures the baseline again when even the minimum work is slow, since the panel must have changed mode', () => {
     const c = settled(16)
-    for (let i = 0; i < 20 && c.samplesPerFrame > 100; i++) feed(c, 30, 4)
-    expect(c.samplesPerFrame).toBe(100)
+    for (let i = 0; i < 20 && c.work > 100; i++) feed(c, 30, 4)
+    expect(c.work).toBe(100)
     expect(c.baselineMs).toBe(16)
     feed(c, 30, 4)
     expect(c.baselineMs).toBeNull()
-    expect(c.samplesPerFrame).toBe(1000)
+    expect(c.work).toBe(1000)
     feed(c, 20, 4)
     expect(c.baselineMs).toBe(20)
   })
@@ -64,24 +64,24 @@ describe('AdaptiveBudget', () => {
     const c = settled()
     expect(feed(c, 30, 3)).toBe(false)
     expect(feed(c, 30, 1)).toBe(true)
-    expect(c.samplesPerFrame).toBe(750)
+    expect(c.work).toBe(750)
     feed(c, 30, 4)
-    expect(c.samplesPerFrame).toBeLessThan(750)
+    expect(c.work).toBeLessThan(750)
   })
 
   it('grows gradually when frames land on the baseline', () => {
     const c = settled()
     expect(feed(c, 16, 4)).toBe(true)
-    expect(c.samplesPerFrame).toBeGreaterThan(1000)
-    expect(c.samplesPerFrame).toBeLessThan(1200)
+    expect(c.work).toBeGreaterThan(1000)
+    expect(c.work).toBeLessThan(1200)
     for (let i = 0; i < 60; i++) feed(c, 16, 4)
-    expect(c.samplesPerFrame).toBe(10000)
+    expect(c.work).toBe(10000)
   })
 
   it('holds steady when frames are only slightly late', () => {
     const c = settled()
     expect(feed(c, 16.4, 8)).toBe(false)
-    expect(c.samplesPerFrame).toBe(1000)
+    expect(c.work).toBe(1000)
   })
 
   it('ignores hitches so one tab switch does not tank the budget', () => {
@@ -89,13 +89,13 @@ describe('AdaptiveBudget', () => {
     feed(c, 16, 3)
     expect(c.record(5000, clock)).toBe(false)
     expect(c.record(16, clock)).toBe(true)
-    expect(c.samplesPerFrame).toBeGreaterThan(1000)
+    expect(c.work).toBeGreaterThan(1000)
   })
 
   it('backs off probing after a grow makes frames late, doubling the wait each time', () => {
     const c = settled()
     feed(c, 16, 4)
-    expect(c.samplesPerFrame).toBeGreaterThan(1000)
+    expect(c.work).toBeGreaterThan(1000)
     expect(feed(c, 30, 4)).toBe(true)
     // Within the probe delay, on-time frames do not grow again.
     expect(feed(c, 16, 4)).toBe(false)
@@ -131,6 +131,6 @@ describe('AdaptiveBudget', () => {
     feed(c, 16, 4)
     expect(feed(c, 30, 4)).toBe(false)
     expect(feed(c, 16, 4)).toBe(false)
-    expect(c.samplesPerFrame).toBe(500)
+    expect(c.work).toBe(500)
   })
 })

@@ -15,15 +15,14 @@ export interface BudgetOptions {
 }
 
 /**
- * The knob is escape-time samples per frame; the renderer turns it into rows per frame
- * and, over a keyframe's lifetime, into resolution and supersampling. The starting work
- * is a third of what the CX managed per frame in earlier builds, so the baseline is
- * measured under a load it is sure to carry.
+ * The knob is pixels shaded per frame, which the renderer turns into a render
+ * resolution. The baseline is measured at 640×360, a load the TV is sure to carry; the
+ * renderer caps the top end at the viewport.
  */
 export const TV_BUDGET_OPTIONS: BudgetOptions = {
-  initial: 30000,
-  min: 4000,
-  max: 4000000,
+  initial: 640 * 360,
+  min: 640 * 360,
+  max: 1920 * 1080,
   baselineFrames: 90,
   window: 60,
   hitchMs: 250,
@@ -52,7 +51,7 @@ const GROW_FACTOR = 1.1
  * moved (the panel changed mode), so it is measured again.
  */
 export class AdaptiveBudget {
-  private _samplesPerFrame: number
+  private _work: number
   private _baselineMs: number | null = null
   private sum = 0
   private count = 0
@@ -61,11 +60,11 @@ export class AdaptiveBudget {
   private nextProbeAt = 0
 
   constructor(private readonly opts: BudgetOptions = TV_BUDGET_OPTIONS) {
-    this._samplesPerFrame = opts.initial
+    this._work = opts.initial
   }
 
-  get samplesPerFrame(): number {
-    return this._samplesPerFrame
+  get work(): number {
+    return this._work
   }
 
   /** Mean frame interval measured under the initial load, or null while it is being measured. */
@@ -107,14 +106,14 @@ export class AdaptiveBudget {
       }
       this.grewLast = false
       this.nextProbeAt = nowMs + this.probeDelay
-      if (this._samplesPerFrame <= this.opts.min) {
+      if (this._work <= this.opts.min) {
         this.rebaseline()
         return false
       }
-      return this.set(this._samplesPerFrame * SHRINK_FACTOR)
+      return this.set(this._work * SHRINK_FACTOR)
     }
     if (average <= this._baselineMs * FAST_RATIO && nowMs >= this.nextProbeAt) {
-      const grew = this.set(this._samplesPerFrame * GROW_FACTOR)
+      const grew = this.set(this._work * GROW_FACTOR)
       this.grewLast = grew
       return grew
     }
@@ -123,14 +122,14 @@ export class AdaptiveBudget {
 
   private rebaseline(): void {
     this._baselineMs = null
-    this._samplesPerFrame = this.opts.initial
+    this._work = this.opts.initial
     this.grewLast = false
   }
 
   private set(value: number): boolean {
     const clamped = Math.max(this.opts.min, Math.min(this.opts.max, value))
-    if (clamped === this._samplesPerFrame) return false
-    this._samplesPerFrame = clamped
+    if (clamped === this._work) return false
+    this._work = clamped
     return true
   }
 }

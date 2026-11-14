@@ -1,56 +1,22 @@
 import { actionForKey, type RemoteAction } from './input/remote'
 import { AdaptiveBudget, TV_BUDGET_OPTIONS } from './perf/adaptive'
-import { CpuRenderer } from './render/cpu'
-import { GlRenderer } from './render/gl'
-import type { FrameParams, RenderBudget, Renderer } from './render/types'
-import type { SceneFrame } from './scene/tour'
-import { PaletteMixer } from './scene/palette'
-import { formulaById, MANDELBROT, type Formula } from './scene/formula'
-import { nearestMisiurewicz, type MisiurewiczPoint } from './scene/misiurewicz'
-import { resolveMisiurewicz, type Scene } from './scene/scenes'
-import { Tour, ZOOM_DOUBLINGS_PER_SECOND } from './scene/tour'
+import { Renderer } from './render/renderer'
 import { Hud } from './ui/hud'
+import { VISUALIZATIONS } from './viz'
+import { PaletteMixer } from './viz/palette'
 
 const SPEED_STEPS = [0.25, 0.5, 1, 1.5, 2, 3, 4]
 const DEFAULT_SPEED_INDEX = 2
 /** Palette cycles per second at 1× speed. Slow enough to read as a mood shift, not a strobe. */
 const COLOR_DRIFT_PER_SECOND = 0.02
-/** Iterations per palette cycle. */
-const COLOR_SCALE = 48
-/** Escape count below which the flat far field fades to black; only shapes the overview. */
-const FAR_FIELD = 10
 /** rAF gaps longer than this are hitches (backgrounding, GC); the scene must not lurch to catch up. */
 const MAX_FRAME_SECONDS = 0.1
+const DISSOLVE_SECONDS = 1.5
 const STARTUP_HUD_MS = 6000
-/** Smoothing for the frame interval fed to keyframe prediction; hitches must not throw the camera far ahead. */
 const FRAME_INTERVAL_SMOOTHING = 0.1
 const HELP_TEXT = '◀ ▶ scene   ▲ ▼ speed   ● ● ● ● palette   OK info   BACK exit'
 
-function createRenderer(canvas: HTMLCanvasElement): Renderer {
-  const gl = GlRenderer.create(canvas)
-  if (gl) return gl
-  return new CpuRenderer(canvas)
-}
-
-interface DebugParams {
-  readonly scene: number | null
-  readonly seek: number | null
-  /** `?cx=&cy=&f=` dives toward the nearest Misiurewicz point of formula `f` to that guess (`&k=&p=` pins its preperiod and period), for scouting new scenes. */
-  readonly custom: Scene | null
-  /** `?scale=` pins keyframe density, `?ss=` samples per texel and `?work=` samples per frame, for measuring on the TV; the rest adapts. */
-  readonly scale: number | null
-  readonly samples: number | null
-  readonly work: number | null
-}
-
-function numberParam(params: URLSearchParams, name: string): number | null {
-  const raw = params.get(name)
-  if (raw === null) return null
-  const value = Number(raw)
-  return isNaN(value) ? null : value
-}
-
-/** webOS launches from file:// with no query string; `ares-launch --params '{"tiles":6}'` arrives here instead. */
+/** webOS launches from file:// with no query string; `ares-launch --params '{"scene":2}'` arrives here instead. */
 function launchParams(): URLSearchParams {
   const params = new URLSearchParams(window.location.search)
   const palm = (window as unknown as { PalmSystem?: { launchParams?: string } }).PalmSystem
@@ -64,44 +30,28 @@ function launchParams(): URLSearchParams {
   return params
 }
 
-function tryResolve(formula: Formula, guess: [number, number], k: number, p: number): MisiurewiczPoint | null {
-  try {
-    return resolveMisiurewicz(formula, guess, k, p)
-  } catch {
-    return null
-  }
+function numberParam(params: URLSearchParams, name: string): number | null {
+  const raw = params.get(name)
+  if (raw === null || raw === '') return null
+  const value = Number(raw)
+  return isNaN(value) ? null : value
 }
 
-function debugParams(): DebugParams {
-  const params = launchParams()
-  const cx = numberParam(params, 'cx')
-  const cy = numberParam(params, 'cy')
-  let custom: Scene | null = null
-  if (cx !== null && cy !== null) {
-    const formula = formulaById(params.get('f') || 'mandelbrot') || MANDELBROT
-    const k = numberParam(params, 'k')
-    const p = numberParam(params, 'p')
-    const point =
-      k !== null && p !== null ? tryResolve(formula, [cx, cy], k, p) : nearestMisiurewicz(formula, [cx, cy], 40, 6, 0.05)
-    if (point) {
-      custom = { kind: 'dive', name: 'Custom ' + formula.name + ' ' + point.c[0].toFixed(6) + ', ' + point.c[1].toFixed(6), point, spin: 0 }
-    }
-  }
-  return {
-    scene: numberParam(params, 'scene'),
-    seek: numberParam(params, 't'),
-    custom,
-    scale: numberParam(params, 'scale'),
-    samples: numberParam(params, 'ss'),
-    work: numberParam(params, 'work'),
-  }
+/** `?scene=` takes an index or a visualization id. */
+function sceneParam(params: URLSearchParams): number {
+  const raw = params.get('scene')
+  if (raw === null) return 0
+  const byId = VISUALIZATIONS.findIndex((v) => v.id === raw)
+  if (byId >= 0) return byId
+  const index = Number(raw)
+  if (isNaN(index)) return 0
+  return ((Math.floor(index) % VISUALIZATIONS.length) + VISUALIZATIONS.length) % VISUALIZATIONS.length
 }
 
 /** Runtime overrides reachable from DevTools as window.__pins, so the budget can be varied on the TV without relaunching. */
 interface Pins {
-  work: number | null
-  density: number | null
-  samples: number | null
+  /** Render resolution as a fraction of the viewport; null adapts. */
+  res: number | null
 }
 
 function main(): void {
@@ -110,21 +60,28 @@ function main(): void {
   if (!(stage instanceof HTMLCanvasElement) || !hudRoot) throw new Error('missing #stage or #hud')
   const canvas: HTMLCanvasElement = stage
 
-  const renderer = createRenderer(canvas)
   const hud = new Hud(hudRoot)
+  const created = Renderer.create(canvas)
+  if (!created) {
+    hud.show({ title: 'Light Show', subtitle: 'WebGL is unavailable on this device', help: '' }, 60000)
+    return
+  }
+  const renderer: Renderer = created
+  const params = launchParams()
   const palettes = new PaletteMixer()
-  const debug = debugParams()
   const budget = new AdaptiveBudget(TV_BUDGET_OPTIONS)
-  const pins: Pins = { work: debug.work, density: debug.scale, samples: debug.samples }
+  const pins: Pins = { res: numberParam(params, 'res') }
   ;(window as unknown as { __pins: Pins }).__pins = pins
-  const tour = debug.custom ? new Tour([debug.custom]) : new Tour(undefined, debug.scene === null ? 0 : debug.scene)
-  if (debug.seek !== null) tour.seek(debug.seek)
+  const paletteIndex = numberParam(params, 'palette')
+  if (paletteIndex !== null) palettes.select(paletteIndex)
 
+  let sceneIndex = sceneParam(params)
+  let time = numberParam(params, 't') || 0
   let speedIndex = DEFAULT_SPEED_INDEX
   let paused = false
-  let colorShift = 0
+  let colorDrift = 0
+  let dissolve = 1
   let lastTimestamp = performance.now()
-  let frameSeconds = 1 / 60
   let averageFrameMs = 1000 / 60
   let renderFailed = false
 
@@ -132,51 +89,35 @@ function main(): void {
     renderer.setSize(Math.max(1, window.innerWidth), Math.max(1, window.innerHeight))
   }
 
-  function renderStats(): string {
-    const stats = renderer.stats
-    const keyframe = stats
-      ? stats.width +
-        '×' +
-        stats.height +
-        ' ×' +
-        stats.samples +
-        ' / ' +
-        stats.rowsPerFrame.toFixed(1) +
-        ' rows  ·  #' +
-        stats.index +
-        ' blend ' +
-        stats.blend.toFixed(2)
-      : '—'
-    return (
-      (renderer.kind === 'webgl' ? 'GPU ' : 'CPU ') +
-      canvas.width +
-      '×' +
-      canvas.height +
-      '  ·  keyframe ' +
-      keyframe +
-      '  ·  ' +
-      Math.round((pins.work !== null ? pins.work : budget.samplesPerFrame) / 1000) +
-      'k/frame  ·  ' +
-      averageFrameMs.toFixed(1) +
-      ' ms' +
-      (budget.baselineMs === null ? '' : ' (base ' + budget.baselineMs.toFixed(1) + ')')
-    )
+  function pixelBudget(): number {
+    if (pins.res === null) return budget.work
+    return Math.round(window.innerWidth * pins.res) * Math.round(window.innerHeight * pins.res)
   }
 
   function hudInfo(): void {
-    const frame = tour.frame()
-    const zoom = frame.depth * Math.LOG10E * Math.LN2
-    const mode = frame.reference.formula.name + ' ×10^' + zoom.toFixed(1)
+    const stats = renderer.stats
     const state = paused ? 'Paused' : SPEED_STEPS[speedIndex] + '×'
     hud.show({
-      title: frame.sceneName,
-      subtitle: mode + '  ·  ' + palettes.current.name + '  ·  ' + state + '  ·  ' + renderStats(),
+      title: VISUALIZATIONS[sceneIndex].name,
+      subtitle:
+        palettes.current.name +
+        '  ·  ' +
+        state +
+        '  ·  ' +
+        stats.width +
+        '×' +
+        stats.height +
+        '  ·  ' +
+        averageFrameMs.toFixed(1) +
+        ' ms' +
+        (budget.baselineMs === null ? '' : ' (base ' + budget.baselineMs.toFixed(1) + ')'),
       help: HELP_TEXT,
     })
   }
 
-  function sceneChanged(): void {
-    palettes.cycle()
+  function changeScene(step: number): void {
+    sceneIndex = (sceneIndex + step + VISUALIZATIONS.length) % VISUALIZATIONS.length
+    dissolve = 0
     budget.invalidate()
   }
 
@@ -190,12 +131,10 @@ function main(): void {
         else hudInfo()
         return
       case 'left':
-        tour.prev()
-        sceneChanged()
+        changeScene(-1)
         break
       case 'right':
-        tour.next()
-        sceneChanged()
+        changeScene(1)
         break
       case 'up':
         speedIndex = Math.min(SPEED_STEPS.length - 1, speedIndex + 1)
@@ -234,52 +173,28 @@ function main(): void {
     lastTimestamp = performance.now()
   })
 
-  function buildFrame(scene: SceneFrame): FrameParams {
-    return {
-      anchor: scene.anchor,
-      offset: scene.offset,
-      log2Scale: scene.log2Scale,
-      rotation: scene.rotation,
-      maxIter: scene.maxIter,
-      reference: scene.reference,
-      sceneId: scene.epoch,
-      palette: palettes.blend(),
-      colorShift,
-      colorScale: COLOR_SCALE,
-      brightness: scene.brightness,
-      farField: FAR_FIELD,
-    }
-  }
-
-  function predict(log2Scale: number): FrameParams {
-    return buildFrame(tour.frameAtLog2Scale(log2Scale))
-  }
-
-  function renderBudget(): RenderBudget {
-    const speed = paused ? 0 : SPEED_STEPS[speedIndex]
-    return {
-      samplesPerFrame: pins.work !== null ? pins.work : budget.samplesPerFrame,
-      doublingsPerFrame: ZOOM_DOUBLINGS_PER_SECOND * speed * frameSeconds,
-      density: pins.density,
-      samples: pins.samples,
-    }
-  }
-
   function loop(timestamp: number): void {
     const frameMs = timestamp - lastTimestamp
     lastTimestamp = timestamp
-    const dt = Math.min(frameMs / 1000, MAX_FRAME_SECONDS)
-    frameSeconds += (dt - frameSeconds) * FRAME_INTERVAL_SMOOTHING
+    const frameSeconds = Math.min(frameMs / 1000, MAX_FRAME_SECONDS)
     averageFrameMs += (Math.min(frameMs, 1000) - averageFrameMs) * FRAME_INTERVAL_SMOOTHING
-    if (!paused) {
-      const speed = SPEED_STEPS[speedIndex]
-      tour.update(dt * speed)
-      colorShift += dt * speed * COLOR_DRIFT_PER_SECOND
-    }
-    palettes.update(dt)
+    const dt = paused ? 0 : frameSeconds * SPEED_STEPS[speedIndex]
+    time += dt
+    colorDrift = (colorDrift + dt * COLOR_DRIFT_PER_SECOND) % 1
+    dissolve = Math.min(1, dissolve + frameSeconds / DISSOLVE_SECONDS)
+    palettes.update(frameSeconds)
     budget.record(frameMs, timestamp)
     try {
-      renderer.render(buildFrame(tour.frame()), predict, renderBudget())
+      renderer.render({
+        viz: VISUALIZATIONS[sceneIndex],
+        time,
+        dt,
+        palette: palettes.blend(),
+        paletteDrift: colorDrift,
+        blend: dissolve * dissolve * (3 - 2 * dissolve),
+        brightness: 1,
+        pixels: pixelBudget(),
+      })
     } catch (error) {
       // A rendering fault must not stop the loop; the next scene may well be fine.
       if (!renderFailed) console.error(String(error))
@@ -289,10 +204,7 @@ function main(): void {
   }
 
   applySize()
-  hud.show(
-    { title: 'Fractals', subtitle: renderer.kind === 'webgl' ? 'GPU rendering' : 'CPU fallback', help: HELP_TEXT },
-    STARTUP_HUD_MS,
-  )
+  hud.show({ title: VISUALIZATIONS[sceneIndex].name, subtitle: palettes.current.name, help: HELP_TEXT }, STARTUP_HUD_MS)
   window.requestAnimationFrame(loop)
 }
 

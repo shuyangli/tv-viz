@@ -1,14 +1,15 @@
 {
-  "name": "tv-fractals",
+  "name": "tv-light-show",
   "version": "0.1.0",
   "private": true,
-  "description": "Ambient Mandelbrot screensaver for LG webOS TV",
+  "description": "Ambient psychedelic light show for LG webOS TV",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
     "icons": "node scripts/make-icons.mjs",
+    "shot": "node scripts/shot.mjs",
     "test": "vitest run",
     "test:watch": "vitest",
     "tv:setup": "ares-setup-device --add tv -i \"host=${TV_IP:-192.168.1.100}\" -i \"port=9922\" -i \"username=prisoner\"",
@@ -21,6 +22,7 @@
     "inspect": "ares-inspect --device tv --app com.shuyangli.fractals --open"
   },
   "devDependencies": {
+    "puppeteer-core": "^25.17.0",
     "typescript": "^5.6.3",
     "vite": "^5.4.10",
     "vitest": "^2.1.4"
