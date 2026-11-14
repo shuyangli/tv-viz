@@ -1,5 +1,6 @@
 import { actionForKey, type RemoteAction } from './input/remote'
 import { AdaptiveBudget, TV_BUDGET_OPTIONS } from './perf/adaptive'
+import { keepScreenAwake } from './platform/screensaver'
 import { Renderer } from './render/renderer'
 import { Hud } from './ui/hud'
 import { VISUALIZATIONS } from './viz'
@@ -204,6 +205,7 @@ function main(): void {
   }
 
   applySize()
+  keepScreenAwake()
   hud.show({ title: VISUALIZATIONS[sceneIndex].name, subtitle: palettes.current.name, help: HELP_TEXT }, STARTUP_HUD_MS)
   window.requestAnimationFrame(loop)
 }

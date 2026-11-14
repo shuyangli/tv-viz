@@ -1,5 +1,5 @@
-// Renders the app icons as PNGs without any image dependency: a tiny Mandelbrot on a
-// dark ground, encoded by hand (zlib is built into Node).
+// Renders the app icons as PNGs without any image dependency: a rainbow spiral, encoded
+// by hand (zlib is built into Node).
 import { deflateSync } from 'node:zlib'
 import { writeFileSync, mkdirSync } from 'node:fs'
 import { dirname, join } from 'node:path'
@@ -11,8 +11,6 @@ const ICONS = [
   { file: 'icon.png', size: 80 },
   { file: 'largeIcon.png', size: 130 },
 ]
-const MAX_ITER = 120
-const BACKGROUND = [5, 6, 10]
 
 const CRC_TABLE = new Uint32Array(256).map((_, n) => {
   let c = n
@@ -55,22 +53,9 @@ function encodePng(width, height, rgba) {
   ])
 }
 
-function escapeTime(cx, cy) {
-  let zx = 0
-  let zy = 0
-  for (let i = 0; i < MAX_ITER; i++) {
-    const xx = zx * zx
-    const yy = zy * zy
-    if (xx + yy > 256) return i + 2 - Math.log2(Math.log2(xx + yy))
-    zy = 2 * zx * zy + cy
-    zx = xx - yy + cx
-  }
-  return -1
-}
-
-function palette(t) {
+function rainbow(t) {
   const ch = (d) => 0.5 + 0.5 * Math.cos(2 * Math.PI * (t + d))
-  return [ch(0), ch(0.1), ch(0.2)]
+  return [ch(0), ch(1 / 3), ch(2 / 3)]
 }
 
 function renderIcon(size) {
@@ -86,14 +71,10 @@ function renderIcon(size) {
         rgba[o + 3] = 0
         continue
       }
-      const cx = -0.65 + (dx / size) * 2.6
-      const cy = (dy / size) * 2.6
-      const n = escapeTime(cx, cy)
-      let rgb = BACKGROUND
-      if (n >= 0) {
-        const fade = Math.min(1, n / 5)
-        rgb = palette(n / 24).map((c) => Math.round(255 * c * fade))
-      }
+      const r = Math.sqrt(dx * dx + dy * dy) / radius
+      const swirl = Math.atan2(dy, dx) / (2 * Math.PI)
+      const wobble = 0.06 * Math.sin(6 * 2 * Math.PI * swirl + r * 9)
+      const rgb = rainbow(r * 2.2 + swirl + wobble).map((c) => Math.round(255 * c))
       rgba[o] = rgb[0]
       rgba[o + 1] = rgb[1]
       rgba[o + 2] = rgb[2]
